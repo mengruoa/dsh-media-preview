@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Media Preview",
+    "description": "Audio and video preview for the sidebar: two viewers over one Range route that keeps seeking working inside the desktop shell."
+  }
+}

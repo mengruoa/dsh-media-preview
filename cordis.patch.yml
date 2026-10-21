@@ -1,0 +1,12 @@
+# dsh-media-preview bundle patch
+#
+# One plugin row. The Host half registers a single `/media-preview` prefix route
+# (metadata probe + Range-capable bytes); the Client half registers TWO file
+# viewers with dsh-better-sidebar — one for audio extensions, one for video —
+# that share the same implementation, so their behaviour cannot drift apart.
+#
+# `name` must equal the package name: the client-modules scan resolves the
+# package's `./client` bundle and serves it at /plugins/dsh-media-preview/client.js.
+- insert:
+    - id: media-preview
+      name: 'dsh-media-preview'
