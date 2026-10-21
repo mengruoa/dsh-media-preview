@@ -109,6 +109,44 @@ console.log('\nthe renderer only splits the ACTIVE line')
   check('word splitting is gated on `active`', clientSource.includes('if (!active || !Array.isArray(line.words)'))
 }
 
+// ── 3b. loadLyrics must PRESERVE word cues ─────────────────────────────────
+// This is the regression that shipped: the host sent word cues, the client's
+// normalization rebuilt each line from {time,text,section} and dropped `words`,
+// so every Enhanced-LRC file silently rendered line-level. Tests that inject
+// lyric data directly cannot see it, so this runs the shipped map() expression
+// against a realistic envelope.
+console.log('\nloadLyrics keeps the word cues through normalization')
+{
+  const start = clientSource.indexOf('if (!Array.isArray(value.lines)')
+  const mapStart = clientSource.indexOf('.map(function (line) {', start)
+  const mapEnd = clientSource.indexOf('}),', mapStart)
+  const mapperSource = clientSource.slice(mapStart, mapEnd + 2)
+
+  const value = {
+    lines: [
+      { time: 1, text: 'abc', section: null, words: [{ time: 1, text: 'a' }, { time: 1.5, text: 'bc' }] },
+      { time: 2, text: 'plain', section: 'S' },
+      { time: 3, text: 'bad cues', words: [{ time: 'nope' }, { text: 'only' }] },
+      { time: 4, text: 'empty cues', words: [] },
+    ],
+  }
+  const sandbox = { value, result: null }
+  vm.createContext(sandbox)
+  vm.runInContext(
+    `result = value.lines
+       .filter(function (line) { return line && typeof line.time === 'number' && typeof line.text === 'string' })
+       ${mapperSource};`,
+    sandbox,
+  )
+  const lines = sandbox.result
+  check('word cues survive the rebuild', Array.isArray(lines[0].words) && lines[0].words.length === 2, JSON.stringify(lines[0].words))
+  check('cue text and time intact', lines[0].words[1].text === 'bc' && near(lines[0].words[1].time, 1.5))
+  check('line-level rows get null words', lines[1].words === null, String(lines[1].words))
+  check('invalid cues are dropped', lines[2].words === null, JSON.stringify(lines[2].words))
+  check('an empty cue list becomes null', lines[3].words === null, JSON.stringify(lines[3].words))
+  check('plain fields still copied', lines[1].section === 'S' && lines[1].text === 'plain')
+}
+
 // ── 4. end to end: a realistic Enhanced LRC document ───────────────────────
 console.log('\nend to end with a realistic Enhanced LRC document')
 {

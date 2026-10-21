@@ -159,6 +159,8 @@ Electron 壳的 `forwardWebRequest` 转发每个响应时会删除 `content-leng
 
 > 为什么不支持 KRC / QRC / YRC？那些是各平台私有格式，毫秒级但加密或序列化（KRC 是 RC4 + ZLIB，QRC 是 protobuf）。精度更高，但需要破译且不便用户自己编辑。Enhanced LRC 精度到 10ms、纯文本可手改，够用。
 
+> **一个曾经踩过的坑**：宿主解析出逐字时间戳后，客户端在归一化每行数据时只重建了 `time` / `text` / `section`，把 `words` 丢掉了 —— 于是服务端一直在发逐字数据，界面却始终只整行高亮，且不报任何错。只有把「宿主 → 客户端 → 渲染」整条链路串起来测才能发现，所以 `e2e-lyrics.test.mjs` 专门守着这条缝。
+
 ## 支持格式
 
 | 类型 | 扩展名 |
@@ -200,7 +202,8 @@ dsh plugin --profile <profile> add "link:<本目录>"
 node test/route.test.mjs     # 宿主路由回归（42 项：206 契约 / Range / 416 / CORS / 栅栏 / 405 / 404）
 node test/gesture.test.mjs   # 手势与键盘（61 项：滑动/双击/长按/轴锁定/音量/键盘/取消）
 node test/lyrics.test.mjs    # LRC 解析与歌词端点（72 项，含逐字时间戳）
-node test/words.test.mjs     # 逐字高亮（37 项）
+node test/words.test.mjs     # 逐字高亮与数据管道（45 项）
+node test/e2e-lyrics.test.mjs # 真实 晚风信.lrc 全链路：宿主 → 归一化 → 逐字（13 项）
 node --check index.js
 node --check client.js
 ```

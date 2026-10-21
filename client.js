@@ -153,10 +153,26 @@ window.__ModuleLoader__.load({
           lines: value.lines
             .filter(function (line) { return line && typeof line.time === 'number' && typeof line.text === 'string' })
             .map(function (line) {
+              // `words` MUST survive this rebuild: it is the only place a line is
+              // re-created on the client, and dropping the field here silently
+              // downgrades every Enhanced-LRC file to line-level highlighting —
+              // the host keeps sending word cues and nothing ever uses them.
+              var words = null
+              if (Array.isArray(line.words)) {
+                var cues = []
+                for (var wi = 0; wi < line.words.length; wi += 1) {
+                  var cue = line.words[wi]
+                  if (cue && typeof cue.time === 'number' && typeof cue.text === 'string') {
+                    cues.push({ time: cue.time, text: cue.text })
+                  }
+                }
+                if (cues.length > 0) words = cues
+              }
               return {
                 time: line.time,
                 text: line.text,
                 section: typeof line.section === 'string' && line.section !== '' ? line.section : null,
+                words: words,
               }
             }),
         }
