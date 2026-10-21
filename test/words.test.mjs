@@ -93,11 +93,13 @@ console.log('\nword index tolerates bad input')
 // ── 3. the highlight styling the renderer applies ──────────────────────────
 console.log('\nhighlight styling: sung bright, current emphasised, rest dim')
 {
-  check('sung words use the primary colour', clientSource.includes("color: 'var(--dsw-alias-label-primary, #ffffff)'"))
-  check('unsung words dim to 0.45', clientSource.includes('opacity: 0.45'))
-  check('the current word carries a glow', clientSource.includes('rgba(150,190,255,0.85)'))
+  check('sung words are white', clientSource.includes("color: '#ffffff'"))
+  check('unsung words use a dim slate, not bare opacity', clientSource.includes('rgba(200,210,230,0.42)'))
+  check('the current syllable is bolded', clientSource.includes('fontWeight: 700'))
+  check('the current syllable carries a blue glow', clientSource.includes('rgba(150,190,255,0.95)'))
   check('spans carry data-word', clientSource.includes("'data-word'"))
   check('spans carry data-sung', clientSource.includes("'data-sung'"))
+  check('spans carry data-current', clientSource.includes("'data-current'"))
 }
 
 console.log('\nthe renderer only splits the ACTIVE line')

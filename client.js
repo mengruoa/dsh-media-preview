@@ -477,6 +477,29 @@ window.__ModuleLoader__.load({
      * @param element - the media element.
      * @returns a message, or null when there is no error.
      */
+    /**
+     * Coerce anything thrown or reported into a renderable message.
+     *
+     * Error state is rendered directly as a text child, so a non-string reaching
+     * it prints "[object Object]" in the UI. Every producer funnels through here.
+     * @param value - an Error, a string, a media error record, or junk.
+     * @returns a non-empty human string, or null.
+     */
+    function errorMessage(value) {
+      if (value === null || value === undefined) return null
+      if (typeof value === 'string') return value.trim() === '' ? null : value
+      if (value instanceof Error) return value.message || value.name || 'Unknown error'
+      if (typeof value === 'object') {
+        var message = value.message
+        if (typeof message === 'string' && message.trim() !== '') return message
+        var code = value.code
+        if (typeof code === 'number') return 'Media error code ' + code
+        return 'The media could not be played.'
+      }
+      var text = String(value)
+      return text.trim() === '' ? null : text
+    }
+
     function mediaErrorText(element) {
       var error = element && element.error
       if (!error) return null
@@ -485,7 +508,7 @@ window.__ModuleLoader__.load({
         case 2: return 'A network error interrupted loading.'
         case 3: return 'This file is corrupt or uses an encoding the browser cannot decode.'
         case 4: return 'This container or codec is not supported by the browser. Use Download to get the original file.'
-        default: return error.message || 'The media could not be played.'
+        default: return errorMessage(error) || 'The media could not be played.'
       }
     }
 
@@ -886,7 +909,7 @@ window.__ModuleLoader__.load({
       var toggle = function () {
         var element = elementRef.current
         if (!element) return
-        if (element.paused) element.play().catch(function (reason) { setError(String(reason && reason.message ? reason.message : reason)) })
+        if (element.paused) element.play().catch(function (reason) { setError(errorMessage(reason) || 'Playback was blocked by the browser.') })
         else element.pause()
       }
 
@@ -1139,7 +1162,10 @@ window.__ModuleLoader__.load({
 
       if (isAudio === undefined) return null
       if (data.error !== undefined) {
-        return react.createElement('div', { style: STYLE.empty }, data.error)
+        // `data.error` comes from the host probe's failure branch and is
+        // rendered as a text child, so anything non-string would print
+        // "[object Object]" in the panel. Coerce before rendering.
+        return react.createElement('div', { style: STYLE.empty }, errorMessage(data.error) || 'This file could not be opened.')
       }
 
       var cycleRate = function () {
@@ -1333,16 +1359,28 @@ window.__ModuleLoader__.load({
         if (!active || !Array.isArray(line.words) || line.words.length === 0) return line.text
         var sung = wordIndexAt(line.words, time)
         return line.words.map(function (word, i) {
-          // Words already sung stay bright; the current one is emphasised; the
-          // rest stay dim, which is the karaoke read.
-          var style = i <= sung
-            ? { color: 'var(--dsw-alias-label-primary, #ffffff)' }
-            : { opacity: 0.45 }
-          if (i === sung) style.textShadow = '0 0 12px rgba(150,190,255,0.85)'
+          // The distinction has to survive a translucent glass panel and a
+          // bright waveform, so it is carried by THREE signals at once: colour
+          // (dim slate vs warm white), a glow on the current syllable, and a
+          // slight size bump. Opacity alone was too subtle to read on video.
+          var style
+          if (i < sung) {
+            style = { color: '#ffffff', opacity: 1 }
+          } else if (i === sung) {
+            style = {
+              color: '#ffffff',
+              opacity: 1,
+              fontWeight: 700,
+              textShadow: '0 0 14px rgba(150,190,255,0.95), 0 0 4px rgba(255,255,255,0.7)',
+            }
+          } else {
+            style = { color: 'rgba(200,210,230,0.42)', opacity: 1 }
+          }
           return react.createElement('span', {
             key: 'w' + i,
             'data-word': String(i),
             'data-sung': i <= sung ? 'true' : 'false',
+            'data-current': i === sung ? 'true' : 'false',
             style: style,
           }, word.text)
         })
@@ -1407,7 +1445,7 @@ window.__ModuleLoader__.load({
             lyricsPanel,
             spectrumPanel,
             hintNode,
-            error !== null ? react.createElement('div', { key: 'err', style: STYLE.notice }, error) : null,
+            error !== null ? react.createElement('div', { key: 'err', style: STYLE.notice }, errorMessage(error)) : null,
           ])
         : null
 
@@ -1417,7 +1455,7 @@ window.__ModuleLoader__.load({
             mediaElement,
             gestureLayer,
             hintNode,
-            error !== null ? react.createElement('div', { key: 'err', style: STYLE.notice }, error) : null,
+            error !== null ? react.createElement('div', { key: 'err', style: STYLE.notice }, errorMessage(error)) : null,
           ])
 
       var barStyle = compact ? STYLE.barCompact : STYLE.bar
