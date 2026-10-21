@@ -146,6 +146,74 @@ console.log('\nreal fixture 晚风邮局.lrc')
   }
 }
 
+// ── Enhanced LRC: word-level timestamps ─────────────────────────────────────
+console.log('\nEnhanced LRC word timestamps')
+{
+  const { lines } = parseLyrics('[00:12.50]<00:12.50>I <00:12.90>see <00:13.40>trees')
+  check('one line', lines.length === 1, `n=${lines.length}`)
+  check('line carries words', Array.isArray(lines[0].words), `words=${lines[0].words}`)
+  check('three words', lines[0].words.length === 3, `n=${lines[0].words.length}`)
+  check('word text preserved', lines[0].words.map((w) => w.text).join('') === 'I see trees', JSON.stringify(lines[0].words.map((w) => w.text)))
+  check('word times parsed', near(lines[0].words[1].time, 12.9), `t=${lines[0].words[1].time}`)
+  check('plain text still available', lines[0].text === 'I see trees', `t=${lines[0].text}`)
+  check('line time unchanged', near(lines[0].time, 12.5))
+}
+
+console.log('\nleading text before the first word timestamp keeps the line time')
+{
+  const { lines } = parseLyrics('[00:10.00]Oh <00:10.50>baby')
+  check('two segments', lines[0].words.length === 2, `n=${lines[0].words.length}`)
+  check('leading segment at line time', near(lines[0].words[0].time, 10), `t=${lines[0].words[0].time}`)
+  check('leading text kept', lines[0].words[0].text.trim() === 'Oh', JSON.stringify(lines[0].words[0].text))
+}
+
+console.log('\nChinese word timestamps')
+{
+  // The shape Chinese karaoke files use: one timestamp per character/run.
+  const { lines } = parseLyrics('[00:13.80]<00:13.80>路灯<00:14.50>把影子<00:15.20>拉得很长')
+  check('three runs', lines[0].words.length === 3, `n=${lines[0].words.length}`)
+  check('characters preserved', lines[0].words.map((w) => w.text).join('') === '路灯把影子拉得很长')
+  check('second run timed', near(lines[0].words[1].time, 14.5))
+}
+
+console.log('\nline-level files are unaffected')
+{
+  // The regression that matters most: no word markers must mean no `words`.
+  const { lines } = parseLyrics('[00:13.80]路灯把影子拉得很长')
+  check('no words array', lines[0].words === undefined, `words=${lines[0].words}`)
+  check('text intact', lines[0].text === '路灯把影子拉得很长')
+}
+
+console.log('\nmultiple timestamps repeat word timings')
+{
+  const { lines } = parseLyrics('[00:10.00][00:50.00]<00:10.00>la <00:10.40>la')
+  check('two lines', lines.length === 2, `n=${lines.length}`)
+  check('both carry words', lines.every((l) => Array.isArray(l.words) && l.words.length === 2))
+}
+
+console.log('\nword timestamps combine with a section marker')
+{
+  const { lines } = parseLyrics('[00:13.80][Chorus]<00:13.80>晚风<00:14.20>邮局')
+  check('section captured', lines[0].section === 'Chorus', `s=${lines[0].section}`)
+  check('marker not in the text', lines[0].text === '晚风邮局', `t=${lines[0].text}`)
+  check('words clean of markers', lines[0].words.length === 2, `n=${lines[0].words.length}`)
+}
+
+console.log('\noffset shifts word timestamps too')
+{
+  const { lines } = parseLyrics('[offset:500]\n[00:10.00]<00:10.00>a <00:11.00>b')
+  // The line moved to 9.5; words follow the same shift so highlighting stays aligned.
+  check('line shifted', near(lines[0].time, 9.5), `t=${lines[0].time}`)
+  check('words shifted with it', near(lines[0].words[0].time, 9.5), `t=${lines[0].words[0].time}`)
+}
+
+console.log('\nmalformed word timestamps degrade to text')
+{
+  const { lines } = parseLyrics('[00:10.00]unclosed <00:11.00 tag')
+  check('no crash, text preserved', lines.length === 1 && lines[0].words === undefined, `words=${lines[0].words}`)
+  check('literal text kept', lines[0].text.includes('tag'), `t=${lines[0].text}`)
+}
+
 // ── the endpoint ────────────────────────────────────────────────────────────
 console.log('\nsidecar lyrics endpoint')
 {

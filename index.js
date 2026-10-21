@@ -331,6 +331,69 @@ const LRC_SECTION = /^\[([^[\]]+)\]\s*$/
 const LRC_SECTION_LEADING = /^\[([^[\]]+)\]/
 
 /**
+ * Enhanced LRC word timestamp: `<mm:ss.xx>` placed before a word.
+ *
+ * This is the widely-adopted word-level extension (Kugou / QQ Music / NetEase /
+ * AIMP all write it), NOT part of the original line-level LRC grammar — but it
+ * is plain text, so one parser can serve both: a file without these markers
+ * yields line-level lyrics unchanged.
+ */
+const LRC_WORD = /<(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?>/g
+
+/**
+ * Convert one LRC timestamp match into seconds.
+ * @param minutes - group 1.
+ * @param seconds - group 2.
+ * @param fraction - group 3, or undefined.
+ * @returns seconds as a float.
+ */
+function stampSeconds(minutes, seconds, fraction) {
+  const fractionText = fraction ?? '0'
+  // `.5` means 500ms, `.50` 500ms, `.500` 500ms — pad to milliseconds.
+  const millis = Number(`${fractionText}00`.slice(0, 3))
+  return Number(minutes) * 60 + Number(seconds) + millis / 1000
+}
+
+/**
+ * Split a lyric body into word-level segments when it carries `<mm:ss.xx>`
+ * timestamps.
+ *
+ * Text before the first word timestamp belongs to the line's own start time, so
+ * it becomes a leading segment at `lineTime` rather than being dropped.
+ * @param body - the text after the line timestamp(s).
+ * @param lineTime - the line's own start, in seconds.
+ * @returns `{ words, text, wordLevel }`; `wordLevel` is false when the body
+ *   carries no inline timestamps.
+ */
+function parseWords(body, lineTime) {
+  LRC_WORD.lastIndex = 0
+  const stamps = []
+  let match
+  while ((match = LRC_WORD.exec(body)) !== null) {
+    stamps.push({ index: match.index, end: match.index + match[0].length, time: stampSeconds(match[1], match[2], match[3]) })
+  }
+
+  if (stamps.length === 0) return { words: null, text: body, wordLevel: false }
+
+  const words = []
+  // Any text before the first timestamp starts at the line time.
+  const lead = body.slice(0, stamps[0].index)
+  if (lead.trim() !== '') words.push({ time: lineTime, text: lead })
+
+  for (let i = 0; i < stamps.length; i += 1) {
+    const stop = i + 1 < stamps.length ? stamps[i + 1].index : body.length
+    const text = body.slice(stamps[i].end, stop)
+    if (text === '') continue
+    words.push({ time: stamps[i].time, text })
+  }
+
+  // Rebuilding from the segments guarantees `text` and `words` agree, which is
+  // what the client's per-word highlight relies on.
+  const text = words.map((word) => word.text).join('')
+  return { words, text: text.trim(), wordLevel: true }
+}
+
+/**
  * Parse LRC text into timed lyric lines.
  *
  * Handles the shapes real files use:
@@ -372,12 +435,7 @@ function parseLyrics(text) {
       // Only leading timestamps count; a bracket inside the text is not one.
       if (match.index !== cursor) break
       cursor = match.index + match[0].length
-      const minutes = Number(match[1])
-      const seconds = Number(match[2])
-      const fractionText = match[3] ?? '0'
-      // `.5` means 500ms, `.50` 500ms, `.500` 500ms — pad to milliseconds.
-      const millis = Number(`${fractionText}00`.slice(0, 3))
-      stamps.push(minutes * 60 + seconds + millis / 1000)
+      stamps.push(stampSeconds(match[1], match[2], match[3]))
     }
 
     if (stamps.length === 0) {
@@ -405,14 +463,31 @@ function parseLyrics(text) {
     }
     pendingSection = null
 
-    for (const time of stamps) lines.push({ time, text: text_, section })
+    // Word-level timestamps (Enhanced LRC) upgrade this line when present.
+    const parsed = parseWords(text_, stamps[0])
+    for (const time of stamps) {
+      lines.push({
+        time,
+        text: parsed.text,
+        section,
+        ...(parsed.wordLevel ? { words: parsed.words } : {}),
+      })
+    }
   }
 
   const offset = Number(meta.offset)
   if (Number.isFinite(offset) && offset !== 0) {
     // `offset` is in milliseconds and follows the LRC convention that a POSITIVE
     // value makes lyrics appear EARLIER (it is subtracted from each timestamp).
-    for (const line of lines) line.time = Math.max(0, line.time - offset / 1000)
+    // Word-level cues must move with their line, or the per-word highlight
+    // would drift away from the audio the moment a file declares an offset.
+    const shift = offset / 1000
+    for (const line of lines) {
+      line.time = Math.max(0, line.time - shift)
+      if (Array.isArray(line.words)) {
+        for (const word of line.words) word.time = Math.max(0, word.time - shift)
+      }
+    }
   }
 
   lines.sort((left, right) => left.time - right.time)
@@ -664,4 +739,4 @@ export function apply(ctx) {
   }), 'dsh-media-preview: media routes')
 }
 
-export { AUDIO_EXTS, VIDEO_EXTS, MEDIA_EXT_SET, MEDIA_TYPES, parseRange, parseLyrics, isTrustedRequest, corsFor }
+export { AUDIO_EXTS, VIDEO_EXTS, MEDIA_EXT_SET, MEDIA_TYPES, parseRange, parseLyrics, parseWords, isTrustedRequest, corsFor }

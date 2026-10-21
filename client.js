@@ -182,7 +182,7 @@ window.__ModuleLoader__.load({
       var high = lines.length - 1
       var found = -1
       while (low <= high) {
-        var mid = (low + high) >> 1
+        var mid = Math.floor((low + high) / 2)
         if (lines[mid].time <= time) {
           found = mid
           low = mid + 1
@@ -1270,6 +1270,47 @@ window.__ModuleLoader__.load({
       // ── audio stage: frosted glass + spectrum + lyrics ───────────────────
       var lyricIndex = lyrics === null ? -1 : lyricIndexAt(lyrics.lines, time)
 
+      /**
+       * Index of the word being sung inside the active line.
+       *
+       * Enhanced LRC carries a timestamp per word; a plain line has none, so
+       * this returns -1 and the whole line highlights instead. The scan is
+       * linear because a line holds a handful of words, and it only runs for
+       * the single active line.
+       * @param words - the active line's word cues, or undefined.
+       * @param at - playback position.
+       * @returns the last word whose time has passed, or -1.
+       */
+      var wordIndexAt = function (words, at) {
+        if (!Array.isArray(words) || words.length === 0) return -1
+        var found = -1
+        for (var i = 0; i < words.length; i += 1) {
+          if (words[i].time <= at) found = i
+          else break
+        }
+        return found
+      }
+
+      /** Render one line's text, splitting it into per-word spans when timed. */
+      var lyricText = function (line, active) {
+        if (!active || !Array.isArray(line.words) || line.words.length === 0) return line.text
+        var sung = wordIndexAt(line.words, time)
+        return line.words.map(function (word, i) {
+          // Words already sung stay bright; the current one is emphasised; the
+          // rest stay dim, which is the karaoke read.
+          var style = i <= sung
+            ? { color: 'var(--dsw-alias-label-primary, #ffffff)' }
+            : { opacity: 0.45 }
+          if (i === sung) style.textShadow = '0 0 12px rgba(150,190,255,0.85)'
+          return react.createElement('span', {
+            key: 'w' + i,
+            'data-word': String(i),
+            'data-sung': i <= sung ? 'true' : 'false',
+            style: style,
+          }, word.text)
+        })
+      }
+
       /** One lyric row; clicking it seeks to that line. */
       var lyricRow = function (line, index) {
         var active = index === lyricIndex
@@ -1278,7 +1319,7 @@ window.__ModuleLoader__.load({
           style: active ? STYLE.lyricLineActive : STYLE.lyricLine,
           onClick: function () { seekTo(line.time) },
           title: 'Jump to ' + clockText(line.time),
-        }, line.text)
+        }, lyricText(line, active))
       }
 
       var lyricsPanel = null
@@ -1439,7 +1480,13 @@ window.__ModuleLoader__.load({
 
     /** One viewer component: the host hands it the `customData` from load(). */
     function Viewer(props) {
-      return react.createElement(MediaSurface, { data: props.customData, title: props.title })
+      // `scope` MUST be forwarded: the lyrics probe needs the session id to
+      // resolve the file, and the audio surface reads it from props.
+      return react.createElement(MediaSurface, {
+        data: props.customData,
+        title: props.title,
+        scope: props.scope,
+      })
     }
 
     /**

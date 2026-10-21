@@ -136,6 +136,29 @@ Electron 壳的 `forwardWebRequest` 转发每个响应时会删除 `content-leng
 
 `.lrc` 大小写扩展名都会探测（`.lrc` / `.LRC` / `.Lrc`）。滚动用**容器内滚动**而非 `scrollIntoView`——后者会往上移动外层滚动容器，可能把整个侧边栏顶偏。
 
+### 逐字时间戳（Enhanced LRC）
+
+标准 LRC 的 `[mm:ss.xx]` 只精确到**行**。要逐字，用 **Enhanced LRC**：在行时间戳后给每个词加 `<mm:ss.xx>` 尖括号时间戳。
+
+这是 LRC 的**广泛采用的扩展**，不属于原始规范，但酷狗、QQ 音乐、网易云、AIMP 都支持，而且**仍然是纯文本** —— 所以同一个解析器同时服务两种文件，行级文件不受任何影响。
+
+```lrc
+[00:59.84][Chorus]<00:59.84>晚风<01:00.60>邮局<01:01.20> 还<01:01.80>开着灯
+```
+
+效果：整行先高亮，然后**逐字点亮**——已唱的字保持亮色，当前字带辉光，未唱的字半透明。只有**当前行**会拆成逐字，其他行仍是整行文本（否则每帧拆全部行既慢也没意义）。
+
+规则：
+
+- 行时间戳 `[mm:ss.xx]` 永远在最前
+- 词时间戳用尖括号 `<mm:ss.xx>`，紧贴词前，不加空格
+- 第一个词的时间戳通常等于行时间戳
+- 尖括号之前的文字归到行时间戳，不会丢
+
+**混合文件完全支持**：一个 LRC 里可以只有几行带逐字标记，其余保持行级。样本见 `晚风邮局-elrc示例.lrc`。
+
+> 为什么不支持 KRC / QRC / YRC？那些是各平台私有格式，毫秒级但加密或序列化（KRC 是 RC4 + ZLIB，QRC 是 protobuf）。精度更高，但需要破译且不便用户自己编辑。Enhanced LRC 精度到 10ms、纯文本可手改，够用。
+
 ## 支持格式
 
 | 类型 | 扩展名 |
@@ -176,7 +199,8 @@ dsh plugin --profile <profile> add "link:<本目录>"
 ```sh
 node test/route.test.mjs     # 宿主路由回归（42 项：206 契约 / Range / 416 / CORS / 栅栏 / 405 / 404）
 node test/gesture.test.mjs   # 手势与键盘（61 项：滑动/双击/长按/轴锁定/音量/键盘/取消）
-node test/lyrics.test.mjs    # LRC 解析与歌词端点（48 项）
+node test/lyrics.test.mjs    # LRC 解析与歌词端点（72 项，含逐字时间戳）
+node test/words.test.mjs     # 逐字高亮（37 项）
 node --check index.js
 node --check client.js
 ```
