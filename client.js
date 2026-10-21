@@ -205,6 +205,15 @@ window.__ModuleLoader__.load({
       return compact
     }
 
+    /** Playback speed steps the speed button cycles through. */
+    var RATES = [1, 1.25, 1.5, 2, 0.5, 0.75]
+    /** Volume step for the arrow keys and the mute button's restorer. */
+    var VOLUME_STEP = 0.05
+    /** Seek step for the arrow keys, in seconds. */
+    var KEY_SEEK_STEP = 5
+    /** Seek step for Shift+arrow, in seconds. */
+    var KEY_SEEK_STEP_LARGE = 30
+
     // ── icons (16px, currentColor, the app's outline style) ────────────────
 
     function iconAudio(size) {
@@ -298,6 +307,16 @@ window.__ModuleLoader__.load({
         background: 'transparent', color: 'inherit',
       },
       seek: { flex: '1 1 auto', minWidth: 40, accentColor: 'var(--dsw-alias-link-normal, #4c8dff)', cursor: 'pointer' },
+      // Volume slider: narrower than the seek bar, so the transport keeps the
+      // flexible width on a small window.
+      volume: {
+        flex: '0 1 84px', minWidth: 48, maxWidth: 96, height: 18,
+        accentColor: 'var(--dsw-alias-link-normal, #4c8dff)', cursor: 'pointer',
+      },
+      volumeCompact: {
+        flex: '0 1 64px', minWidth: 44, height: 24,
+        accentColor: 'var(--dsw-alias-link-normal, #4c8dff)', cursor: 'pointer',
+      },
       time: {
         flex: 'none', fontVariantNumeric: 'tabular-nums',
         color: 'var(--dsw-alias-label-secondary, #8b90a0)',
@@ -382,6 +401,44 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Speaker glyph reflecting the current volume.
+     * @param size - pixel size.
+     * @param volume - 0..1 effective volume (0 when muted).
+     * @returns the icon node.
+     */
+    function iconVolume(size, volume) {
+      var waves = []
+      if (volume > 0.02) {
+        waves.push(react.createElement('path', {
+          key: 'w1', d: 'M9.8 5.6a3.2 3.2 0 0 1 0 4.8',
+          stroke: 'currentColor', strokeWidth: 1.3, strokeLinecap: 'round',
+        }))
+      }
+      if (volume > 0.55) {
+        waves.push(react.createElement('path', {
+          key: 'w2', d: 'M11.7 3.7a5.9 5.9 0 0 1 0 8.6',
+          stroke: 'currentColor', strokeWidth: 1.3, strokeLinecap: 'round',
+        }))
+      }
+      var parts = [
+        react.createElement('path', {
+          key: 'body', d: 'M8 2.6 5.1 5H3.1v6h2L8 13.4z',
+          fill: 'currentColor',
+        }),
+      ]
+      if (volume <= 0.02) {
+        parts.push(react.createElement('path', {
+          key: 'mute', d: 'M10.6 6.1l3 3m0-3-3 3',
+          stroke: 'currentColor', strokeWidth: 1.3, strokeLinecap: 'round',
+        }))
+      }
+      return react.createElement('svg', {
+        width: size, height: size, viewBox: '0 0 16 16', fill: 'none',
+        'aria-hidden': true, focusable: 'false',
+      }, parts.concat(waves))
+    }
+
+    /**
      * The shared surface: one component for both preview kinds.
      * @param props - `data` is the resolved source (or its failure branch).
      */
@@ -402,6 +459,14 @@ window.__ModuleLoader__.load({
       var error = errorState[0], setError = errorState[1]
       var rateState = react.useState(1)
       var rate = rateState[0], setRate = rateState[1]
+      // Volume is mirrored in React state so the slider and the speaker glyph
+      // re-render; the element stays authoritative and these follow its events.
+      var volumeState = react.useState(1)
+      var volume = volumeState[0], setVolumeState = volumeState[1]
+      var mutedState = react.useState(false)
+      var muted = mutedState[0], setMutedState = mutedState[1]
+      /** Volume restored when unmuting (0 would make the button a dead end). */
+      var restoreVolumeRef = react.useRef(1)
       // Gesture feedback: { kind: 'seek'|'volume'|'rate', text, side } or null.
       var hintState = react.useState(null)
       var hint = hintState[0], setHint = hintState[1]
@@ -447,9 +512,34 @@ window.__ModuleLoader__.load({
       var setVolume = function (next) {
         var element = elementRef.current
         if (!element) return
-        element.volume = clamp01(next)
-        element.muted = element.volume === 0
+        var value = clamp01(next)
+        element.volume = value
+        // Dragging the slider up from zero should un-mute, not stay silent.
+        element.muted = value === 0
+        if (value > 0) restoreVolumeRef.current = value
+        setVolumeState(element.volume)
+        setMutedState(element.muted)
         return element.volume
+      }
+
+      /**
+       * Toggle mute, remembering the last audible level so unmuting restores it
+       * rather than leaving the player silent at 0.
+       */
+      var toggleMute = function () {
+        var element = elementRef.current
+        if (!element) return
+        if (element.muted || element.volume === 0) {
+          element.muted = false
+          if (element.volume === 0) element.volume = restoreVolumeRef.current > 0 ? restoreVolumeRef.current : 1
+        } else {
+          restoreVolumeRef.current = element.volume
+          element.muted = true
+        }
+        setVolumeState(element.volume)
+        setMutedState(element.muted)
+        setHint({ kind: 'volume', text: element.muted ? 'Muted' : Math.round(element.volume * 100) + '%' })
+        setTimeout(function () { setHint(null) }, 700)
       }
 
       // Wire the element's own events. No polling: the element is the source of
@@ -468,6 +558,11 @@ window.__ModuleLoader__.load({
         var onEnded = function () { setPaused(true) }
         var onError = function () { setError(mediaErrorText(element)) }
         var onRate = function () { setRate(element.playbackRate) }
+        var onVolume = function () {
+          setVolumeState(element.volume)
+          setMutedState(element.muted)
+          if (element.volume > 0 && !element.muted) restoreVolumeRef.current = element.volume
+        }
 
         element.addEventListener('loadedmetadata', onMeta)
         element.addEventListener('durationchange', onMeta)
@@ -479,6 +574,7 @@ window.__ModuleLoader__.load({
         element.addEventListener('ended', onEnded)
         element.addEventListener('error', onError)
         element.addEventListener('ratechange', onRate)
+        element.addEventListener('volumechange', onVolume)
 
         return function () {
           element.removeEventListener('loadedmetadata', onMeta)
@@ -491,6 +587,7 @@ window.__ModuleLoader__.load({
           element.removeEventListener('ended', onEnded)
           element.removeEventListener('error', onError)
           element.removeEventListener('ratechange', onRate)
+          element.removeEventListener('volumechange', onVolume)
         }
       }, [data.url])
 
@@ -667,11 +764,112 @@ window.__ModuleLoader__.load({
       var cycleRate = function () {
         var element = elementRef.current
         if (!element) return
-        var rates = [1, 1.25, 1.5, 2, 0.5, 0.75]
-        var index = rates.indexOf(element.playbackRate)
-        var next = rates[(index + 1) % rates.length]
+        var index = RATES.indexOf(element.playbackRate)
+        var next = RATES[(index + 1) % RATES.length]
         element.playbackRate = next
         setRate(next)
+      }
+
+      /**
+       * Keyboard transport, bound on the player root so it only fires while the
+       * player (not the chat composer) has focus.
+       *
+       * Keys follow the conventions of desktop video players: Space/K play,
+       * J/L skip, arrows seek and set volume, M mute, F fullscreen, 0-9 jump to
+       * a percentage. Modified keystrokes are never hijacked, so browser and
+       * app shortcuts still work.
+       */
+      var onKeyDown = function (event) {
+        var element = elementRef.current
+        if (!element) return
+        // Leave OS/app shortcuts (Ctrl+R, Alt+Tab, Cmd+K…) alone.
+        if (event.ctrlKey || event.metaKey || event.altKey) return
+        // A focused slider or button handles its own keys (arrow keys move a
+        // range input natively).
+        var tag = event.target && event.target.tagName ? String(event.target.tagName).toLowerCase() : ''
+        var type = event.target && event.target.type ? String(event.target.type).toLowerCase() : ''
+        if (type === 'range') return
+
+        var key = event.key
+        var handled = true
+
+        switch (key) {
+          case ' ':
+          case 'Spacebar':
+          case 'k':
+          case 'K':
+            toggle()
+            break
+          case 'ArrowLeft':
+            seekTo(element.currentTime - (event.shiftKey ? KEY_SEEK_STEP_LARGE : KEY_SEEK_STEP))
+            break
+          case 'ArrowRight':
+            seekTo(element.currentTime + (event.shiftKey ? KEY_SEEK_STEP_LARGE : KEY_SEEK_STEP))
+            break
+          case 'ArrowUp':
+            setVolume((element.muted ? 0 : element.volume) + VOLUME_STEP)
+            setMutedState(element.muted)
+            setHint({ kind: 'volume', text: Math.round(element.volume * 100) + '%' })
+            setTimeout(function () { setHint(null) }, 700)
+            break
+          case 'ArrowDown':
+            setVolume((element.muted ? 0 : element.volume) - VOLUME_STEP)
+            setMutedState(element.muted)
+            setHint({ kind: 'volume', text: element.volume === 0 ? 'Muted' : Math.round(element.volume * 100) + '%' })
+            setTimeout(function () { setHint(null) }, 700)
+            break
+          case 'm':
+          case 'M':
+            toggleMute()
+            break
+          case 'j':
+          case 'J':
+            seekTo(element.currentTime - KEY_SEEK_STEP_LARGE)
+            break
+          case 'l':
+          case 'L':
+            seekTo(element.currentTime + KEY_SEEK_STEP_LARGE)
+            break
+          case 'Home':
+            seekTo(0)
+            break
+          case 'End':
+            seekTo(isFinite(element.duration) ? element.duration : element.currentTime)
+            break
+          case 'f':
+          case 'F': {
+            var stageNode = stageRef.current
+            if (!stageNode) { handled = false; break }
+            var doc = stageNode.ownerDocument
+            if (doc && doc.fullscreenElement) doc.exitFullscreen().catch(function () {})
+            else if (stageNode.requestFullscreen) stageNode.requestFullscreen().catch(function () {})
+            break
+          }
+          case '.':
+          case '>':
+            // Step one frame back; browsers have no frame API, so use ~24fps.
+            seekTo(element.currentTime + 1 / 24)
+            break
+          case ',':
+          case '<':
+            seekTo(element.currentTime - 1 / 24)
+            break
+          default:
+            handled = false
+        }
+
+        // Digits jump to a percentage of the clip (0..9 -> 0%..90%).
+        if (!handled && key.length === 1 && key >= '0' && key <= '9' && isFinite(element.duration) && element.duration > 0) {
+          seekTo((Number(key) / 10) * element.duration)
+          handled = true
+        }
+
+        if (handled) {
+          // Keep the page from scrolling on Space/arrows.
+          event.preventDefault()
+          event.stopPropagation()
+        }
+        void tag
       }
 
       var downloadHref = data.url
@@ -751,13 +949,45 @@ window.__ModuleLoader__.load({
         onChange: function (event) { seekTo(Number(event.target.value)) },
       })
 
+      var volumeEffective = muted ? 0 : volume
+
+      var volumeButton = react.createElement('button', {
+        key: 'mute',
+        type: 'button',
+        style: compact
+          ? Object.assign({}, STYLE.buttonCompact, { width: 36 })
+          : Object.assign({}, STYLE.button, { width: 24 }),
+        onClick: toggleMute,
+        title: muted || volume === 0 ? 'Unmute (M)' : 'Mute (M)',
+        'aria-label': muted || volume === 0 ? 'Unmute' : 'Mute',
+      }, iconVolume(compact ? 20 : 16, volumeEffective))
+
+      var volumeSlider = react.createElement('input', {
+        key: 'volume',
+        type: 'range',
+        min: 0,
+        max: 1,
+        step: 0.01,
+        // Show the muted state as an empty slider, matching the glyph.
+        value: volumeEffective,
+        style: compact ? STYLE.volumeCompact : STYLE.volume,
+        'aria-label': 'Volume',
+        title: 'Volume (↑ / ↓)',
+        onChange: function (event) {
+          var next = Number(event.target.value)
+          var element = elementRef.current
+          if (element && element.muted) element.muted = false
+          setVolume(next)
+        },
+      })
+
       var barChildren = [
         react.createElement('button', {
           key: 'play',
           type: 'button',
           style: buttonStyle,
           onClick: toggle,
-          title: paused ? 'Play' : 'Pause',
+          title: paused ? 'Play (Space)' : 'Pause (Space)',
           'aria-label': paused ? 'Play' : 'Pause',
         }, iconPlay(compact ? 20 : 16, paused)),
         react.createElement('span', { key: 'cur', style: STYLE.time }, clockText(time)),
@@ -765,6 +995,11 @@ window.__ModuleLoader__.load({
         // between the two clocks.
         compact ? null : seekInput,
         react.createElement('span', { key: 'dur', style: STYLE.time }, clockText(duration)),
+        // Volume: keyed controls for mouse/keyboard. On touch the stage swipe
+        // already owns volume, so compact mode keeps the mute button but drops
+        // the slider to save a row.
+        volumeButton,
+        compact ? null : volumeSlider,
         react.createElement('button', {
           key: 'rate',
           type: 'button',
@@ -789,7 +1024,15 @@ window.__ModuleLoader__.load({
         }, 'Download'),
       ])
 
-      return react.createElement('div', { style: STYLE.root }, [stage, bar, footer])
+      // tabIndex so the player can take focus and receive keys without the
+      // chat composer competing for them; the outline is suppressed because the
+      // stage already reads as the interactive surface.
+      return react.createElement('div', {
+        style: Object.assign({}, STYLE.root, { outline: 'none' }),
+        tabIndex: 0,
+        onKeyDown: onKeyDown,
+        'aria-label': data.name,
+      }, [stage, bar, footer])
     }
 
     /** One viewer component: the host hands it the `customData` from load(). */

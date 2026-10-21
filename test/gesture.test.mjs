@@ -122,6 +122,12 @@ function mount(options = {}) {
         handlers.pointerCancel = props.onPointerCancel
         handlers.gestureStyle = props.style
       }
+      // The root carries the keyboard transport.
+      if (props && typeof props.onKeyDown === 'function') handlers.keyDown = props.onKeyDown
+      // Volume / mute / speed buttons, captured by their handler identity.
+      if (props && typeof props.onChange === 'function' && props['aria-label'] === 'Volume') handlers.volumeChange = props.onChange
+      if (props && typeof props.onClick === 'function' && (props['aria-label'] === 'Mute' || props['aria-label'] === 'Unmute')) handlers.muteClick = props.onClick
+      if (props && typeof props.onClick === 'function' && props['aria-label'] === 'Playback speed') handlers.rateClick = props.onClick
       // The stage is the node whose ref the swipe maths measures.
       if (props && props.ref && typeof props.ref === 'object' && props.style && props.style.position === 'relative') {
         stageRefObject = props.ref
@@ -412,6 +418,175 @@ console.log('\nno gesture layer for audio')
   check('audio has no pointer handlers', handlers.pointerDown === undefined)
   const audio = find(tree, (node) => node.type === 'audio')
   check('audio element rendered', audio !== undefined)
+}
+
+// ── volume controls (mouse / keyboard mode) ─────────────────────────────────
+console.log('\nmute button toggles and remembers the previous level')
+{
+  const { media, handlers } = mount({ duration: 300, volume: 0.6 })
+  check('mute handler present', typeof handlers.muteClick === 'function')
+  handlers.muteClick()
+  check('muted', media.muted === true)
+  check('volume preserved while muted', media.volume === 0.6, `vol=${media.volume}`)
+  handlers.muteClick()
+  check('unmuted restores level', media.muted === false && media.volume === 0.6, `vol=${media.volume}`)
+}
+
+console.log('\nunmuting from zero restores an audible level')
+{
+  const { media, handlers } = mount({ duration: 300, volume: 0.4 })
+  // Enter the muted state through the button (which records the level), then
+  // drag the slider to zero — the restorer must still hold the audible level.
+  handlers.muteClick()
+  check('muted via the button', media.muted === true)
+  handlers.muteClick()
+  check('back to the recorded level', media.muted === false && Math.abs(media.volume - 0.4) < 0.001, `vol=${media.volume}`)
+  handlers.volumeChange({ target: { value: '0' } })
+  check('slider to zero mutes', media.muted === true && media.volume === 0, `vol=${media.volume}`)
+  handlers.muteClick()
+  check('unmute restores the last audible level', media.muted === false && media.volume === 0.4, `vol=${media.volume}`)
+}
+
+console.log('\nvolume slider sets the level')
+{
+  const { media, handlers } = mount({ duration: 300, volume: 1 })
+  handlers.volumeChange({ target: { value: '0.35' } })
+  check('volume applied', Math.abs(media.volume - 0.35) < 0.001, `vol=${media.volume}`)
+  check('not muted at nonzero volume', media.muted === false)
+}
+
+console.log('\nvolume slider also un-mutes')
+{
+  const { media, handlers } = mount({ duration: 300, volume: 0.5 })
+  handlers.muteClick()
+  check('precondition: muted', media.muted === true)
+  handlers.volumeChange({ target: { value: '0.8' } })
+  check('raising the slider unmutes', media.muted === false, `muted=${media.muted}`)
+}
+
+// ── keyboard shortcuts ─────────────────────────────────────────────────────
+/** Synthetic keydown; `prevented` records whether the handler claimed it. */
+function key(k, extra = {}) {
+  const event = {
+    key: k,
+    shiftKey: false,
+    ctrlKey: false,
+    metaKey: false,
+    altKey: false,
+    target: { tagName: 'DIV', type: undefined },
+    _prevented: false,
+    preventDefault() { event._prevented = true },
+    stopPropagation() {},
+    ...extra,
+  }
+  return event
+}
+
+console.log('\nSpace and K toggle playback')
+{
+  const { media, handlers } = mount({ duration: 300, paused: true })
+  const event = key(' ')
+  handlers.keyDown(event)
+  check('Space claimed by the player', event._prevented === true)
+  await settle(320)
+  check('Space played', media._plays === 1, `plays=${media._plays}`)
+}
+
+console.log('\narrow keys seek')
+{
+  const { media, handlers } = mount({ duration: 300, currentTime: 100 })
+  handlers.keyDown(key('ArrowRight'))
+  check('right +5s', Math.abs(media.currentTime - 105) < 0.001, `ct=${media.currentTime}`)
+  handlers.keyDown(key('ArrowLeft'))
+  check('left -5s', Math.abs(media.currentTime - 100) < 0.001, `ct=${media.currentTime}`)
+}
+
+console.log('\nshift+arrow seeks further')
+{
+  const { media, handlers } = mount({ duration: 300, currentTime: 100 })
+  handlers.keyDown(key('ArrowRight', { shiftKey: true }))
+  check('shift+right +30s', Math.abs(media.currentTime - 130) < 0.001, `ct=${media.currentTime}`)
+}
+
+console.log('\nJ and L jump 30s')
+{
+  const { media, handlers } = mount({ duration: 300, currentTime: 100 })
+  handlers.keyDown(key('l'))
+  check('L +30s', Math.abs(media.currentTime - 130) < 0.001, `ct=${media.currentTime}`)
+  handlers.keyDown(key('j'))
+  check('J -30s', Math.abs(media.currentTime - 100) < 0.001, `ct=${media.currentTime}`)
+}
+
+console.log('\narrow up/down change volume')
+{
+  const { media, handlers } = mount({ duration: 300, volume: 0.5 })
+  handlers.keyDown(key('ArrowUp'))
+  check('up +5%', Math.abs(media.volume - 0.55) < 0.001, `vol=${media.volume}`)
+  handlers.keyDown(key('ArrowDown'))
+  check('down -5%', Math.abs(media.volume - 0.5) < 0.001, `vol=${media.volume}`)
+}
+
+console.log('\nvolume keys clamp at the ends')
+{
+  const { media, handlers } = mount({ duration: 300, volume: 0.02 })
+  handlers.keyDown(key('ArrowDown'))
+  handlers.keyDown(key('ArrowDown'))
+  check('clamped at 0', media.volume === 0, `vol=${media.volume}`)
+  for (let i = 0; i < 30; i += 1) handlers.keyDown(key('ArrowUp'))
+  check('clamped at 1', media.volume === 1, `vol=${media.volume}`)
+}
+
+console.log('\nM mutes')
+{
+  const { media, handlers } = mount({ duration: 300, volume: 0.7 })
+  handlers.keyDown(key('m'))
+  check('muted via M', media.muted === true)
+  handlers.keyDown(key('m'))
+  check('unmuted via M', media.muted === false)
+}
+
+console.log('\nHome and End jump to the ends')
+{
+  const { media, handlers } = mount({ duration: 300, currentTime: 100 })
+  handlers.keyDown(key('End'))
+  check('End goes to duration', Math.abs(media.currentTime - 300) < 0.001, `ct=${media.currentTime}`)
+  handlers.keyDown(key('Home'))
+  check('Home goes to 0', media.currentTime === 0, `ct=${media.currentTime}`)
+}
+
+console.log('\ndigit keys jump to a percentage')
+{
+  const { media, handlers } = mount({ duration: 300, currentTime: 0 })
+  handlers.keyDown(key('5'))
+  check('5 jumps to 50%', Math.abs(media.currentTime - 150) < 0.001, `ct=${media.currentTime}`)
+  handlers.keyDown(key('0'))
+  check('0 jumps to the start', media.currentTime === 0, `ct=${media.currentTime}`)
+}
+
+console.log('\nmodifier combinations are left to the browser')
+{
+  const { media, handlers } = mount({ duration: 300, currentTime: 100 })
+  const event = key('ArrowRight', { ctrlKey: true })
+  handlers.keyDown(event)
+  check('Ctrl+Right not handled', event._prevented === false)
+  check('seek untouched', media.currentTime === 100, `ct=${media.currentTime}`)
+}
+
+console.log('\na focused range slider keeps its own arrow keys')
+{
+  const { media, handlers } = mount({ duration: 300, currentTime: 100 })
+  const event = key('ArrowRight', { target: { tagName: 'INPUT', type: 'range' } })
+  handlers.keyDown(event)
+  check('range input not hijacked', event._prevented === false)
+  check('seek untouched', media.currentTime === 100, `ct=${media.currentTime}`)
+}
+
+console.log('\nunknown keys are ignored')
+{
+  const { handlers } = mount({ duration: 300, currentTime: 100 })
+  const event = key('q')
+  handlers.keyDown(event)
+  check('q not claimed', event._prevented === false)
 }
 
 console.log(`\n${pass} checks passed, ${failed} failed`)
