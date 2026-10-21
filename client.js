@@ -151,6 +151,60 @@ window.__ModuleLoader__.load({
       return (unit === 0 ? String(value) : value.toFixed(value >= 10 ? 0 : 1)) + ' ' + units[unit]
     }
 
+    // ── gestures ───────────────────────────────────────────────────────────
+
+    /** Seconds a full-width horizontal swipe can traverse (capped by duration). */
+    var SEEK_SWIPE_SPAN = 90
+    /** Double-tap skip distance, in seconds. */
+    var SEEK_STEP = 10
+    /** Movement (px) before an undecided drag picks an axis. */
+    var AXIS_THRESHOLD = 10
+    /** Long-press duration before the temporary fast-forward engages (ms). */
+    var LONG_PRESS_MS = 500
+    /** Single-tap fires after this delay so a double tap can cancel it (ms). */
+    var TAP_DELAY_MS = 250
+    /** Two taps closer than this in time (and space) are a double tap (ms). */
+    var DOUBLE_TAP_MS = 320
+
+    /** Clamp to a range, tolerating NaN. */
+    function clamp(value, min, max) {
+      if (!isFinite(value)) return min
+      if (max < min) return min
+      return Math.min(Math.max(value, min), max)
+    }
+
+    /** Clamp to 0..1. */
+    function clamp01(value) {
+      return clamp(value, 0, 1)
+    }
+
+    /**
+     * Whether the player should use its touch layout.
+     *
+     * Keyed on the pointer rather than the window width: a narrow desktop
+     * window still has a mouse (and wants the dense bar with more precision),
+     * while a phone or tablet in landscape is wide but still needs 44px targets.
+     * Width is a secondary signal for coarse-pointer-less touch hardware.
+     * @returns true when the touch layout applies.
+     */
+    function useCompact() {
+      var state = react.useState(false)
+      var compact = state[0], setCompact = state[1]
+      react.useEffect(function () {
+        if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return undefined
+        var query = window.matchMedia('(pointer: coarse), (max-width: 520px)')
+        var update = function () { setCompact(query.matches) }
+        update()
+        if (typeof query.addEventListener === 'function') {
+          query.addEventListener('change', update)
+          return function () { query.removeEventListener('change', update) }
+        }
+        query.addListener(update)
+        return function () { query.removeListener(update) }
+      }, [])
+      return compact
+    }
+
     // ── icons (16px, currentColor, the app's outline style) ────────────────
 
     function iconAudio(size) {
@@ -270,6 +324,48 @@ window.__ModuleLoader__.load({
         height: '100%', padding: 16, fontSize: 12, textAlign: 'center',
         color: 'var(--dsw-alias-label-secondary, #8b90a0)',
       },
+      // Touch layout: the bar wraps so the seek input gets its own full-width
+      // row instead of being squeezed between the clock readouts.
+      barCompact: {
+        flex: '0 0 auto', display: 'flex', alignItems: 'center',
+        flexWrap: 'wrap', gap: 4, fontSize: 12, minWidth: 0,
+      },
+      seekRowCompact: {
+        flex: '1 0 100%', display: 'flex', alignItems: 'center',
+        order: 9, paddingBottom: 4,
+      },
+      // 44px is the smallest comfortably tappable target.
+      buttonCompact: {
+        flex: 'none', display: 'inline-flex', alignItems: 'center',
+        justifyContent: 'center', width: 44, height: 44, padding: 0,
+        border: 'none', borderRadius: 8, cursor: 'pointer',
+        background: 'transparent', color: 'inherit',
+      },
+      seekCompact: {
+        flex: '1 1 auto', minWidth: 0, height: 28,
+        accentColor: 'var(--dsw-alias-link-normal, #4c8dff)', cursor: 'pointer',
+      },
+      // Transient gesture feedback drawn over the stage.
+      gesture: {
+        position: 'absolute', display: 'flex', alignItems: 'center', gap: 6,
+        padding: '6px 12px', borderRadius: 999, fontSize: 13,
+        fontWeight: 500, fontVariantNumeric: 'tabular-nums',
+        color: '#fff', background: 'rgba(0, 0, 0, 0.62)',
+        backdropFilter: 'blur(4px)', pointerEvents: 'none',
+        whiteSpace: 'nowrap',
+      },
+      gestureSide: {
+        position: 'absolute', top: '50%', transform: 'translateY(-50%)',
+        display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2,
+        padding: '10px 14px', borderRadius: 12, fontSize: 12,
+        color: '#fff', background: 'rgba(0, 0, 0, 0.55)',
+        pointerEvents: 'none', whiteSpace: 'nowrap',
+      },
+      // Tap target that covers the stage so a tap anywhere toggles playback.
+      surface: {
+        position: 'absolute', inset: 0, cursor: 'pointer',
+        touchAction: 'none', // keep the browser from panning instead of seeking
+      },
     }
 
     /** Play/pause glyph. */
@@ -293,6 +389,8 @@ window.__ModuleLoader__.load({
       var data = props.data || {}
       var isAudio = data.kind === 'audio'
       var elementRef = react.useRef(null)
+      var stageRef = react.useRef(null)
+      var compact = useCompact()
 
       var pausedState = react.useState(true)
       var paused = pausedState[0], setPaused = pausedState[1]
@@ -304,6 +402,55 @@ window.__ModuleLoader__.load({
       var error = errorState[0], setError = errorState[1]
       var rateState = react.useState(1)
       var rate = rateState[0], setRate = rateState[1]
+      // Gesture feedback: { kind: 'seek'|'volume'|'rate', text, side } or null.
+      var hintState = react.useState(null)
+      var hint = hintState[0], setHint = hintState[1]
+
+      /**
+       * Live gesture state. A ref (not state) because pointermove must not
+       * re-render: a re-render mid-drag would rebuild the handlers and could
+       * drop pointer capture.
+       */
+      var gestureRef = react.useRef(null)
+
+      /** Cancel the pending single-tap so a double tap stays a double tap. */
+      var tapTimerRef = react.useRef(null)
+      /** Timestamp + position of the previous tap, for double-tap detection. */
+      var lastTapRef = react.useRef({ at: 0, x: 0, y: 0 })
+      /** Clear the pending tap timer on unmount. */
+      react.useEffect(function () {
+        return function () {
+          if (tapTimerRef.current !== null) {
+            clearTimeout(tapTimerRef.current)
+            tapTimerRef.current = null
+          }
+        }
+      }, [])
+
+      var seekTo = function (next) {
+        var element = elementRef.current
+        if (!element) return
+        // Clamp against the element's own window; assigning an out-of-range
+        // currentTime is what silently snaps back.
+        var upper = isFinite(element.duration) ? element.duration : 0
+        element.currentTime = Math.max(0, Math.min(next, upper))
+        setTime(element.currentTime)
+      }
+
+      var toggle = function () {
+        var element = elementRef.current
+        if (!element) return
+        if (element.paused) element.play().catch(function (reason) { setError(String(reason && reason.message ? reason.message : reason)) })
+        else element.pause()
+      }
+
+      var setVolume = function (next) {
+        var element = elementRef.current
+        if (!element) return
+        element.volume = clamp01(next)
+        element.muted = element.volume === 0
+        return element.volume
+      }
 
       // Wire the element's own events. No polling: the element is the source of
       // truth, so a seek that the element rejects can never desync the bar.
@@ -347,26 +494,174 @@ window.__ModuleLoader__.load({
         }
       }, [data.url])
 
+      /**
+       * Pointer-down on the stage: start tracking, arm the long-press timer,
+       * and decide nothing until the pointer actually moves past the threshold
+       * (a tap and a swipe begin identically).
+       */
+      var onPointerDown = function (event) {
+        var element = elementRef.current
+        if (!element) return
+        // Only the primary button / first touch drives gestures.
+        if (event.button !== undefined && event.button > 0) return
+
+        var drag = {
+          id: event.pointerId,
+          startX: event.clientX,
+          startY: event.clientY,
+          startTime: element.currentTime,
+          startVolume: element.muted ? 0 : element.volume,
+          startDuration: isFinite(element.duration) ? element.duration : 0,
+          axis: null,
+          longPressed: false,
+          resumeAfterLongPress: false,
+          lastTapAt: lastTapRef.current.at,
+          lastTapX: lastTapRef.current.x,
+          lastTapY: lastTapRef.current.y,
+          moved: false,
+        }
+        gestureRef.current = drag
+
+        try { event.currentTarget.setPointerCapture(event.pointerId) } catch (ignored) { /* older engines */ }
+
+        // Long press: temporary 3x fast-forward, restored on release.
+        drag.longPressTimer = setTimeout(function () {
+          if (gestureRef.current !== drag || drag.moved) return
+          drag.longPressed = true
+          drag.resumeAfterLongPress = !element.paused
+          drag.savedRate = element.playbackRate
+          element.playbackRate = 3
+          if (element.paused) element.play().catch(function () { /* autoplay policy */ })
+          setHint({ kind: 'rate', text: '3× fast-forward' })
+        }, LONG_PRESS_MS)
+      }
+
+      /**
+       * Pointer-move: the first movement past the threshold locks an axis.
+       * Horizontal = seek, vertical = volume. Locking prevents the two from
+       * fighting each other on a diagonal swipe.
+       */
+      var onPointerMove = function (event) {
+        var drag = gestureRef.current
+        var element = elementRef.current
+        if (!drag || !element || drag.id !== event.pointerId) return
+
+        var dx = event.clientX - drag.startX
+        var dy = event.clientY - drag.startY
+
+        if (drag.axis === null) {
+          if (Math.abs(dx) < AXIS_THRESHOLD && Math.abs(dy) < AXIS_THRESHOLD) return
+          drag.moved = true
+          // A real drag cancels the long-press arm.
+          if (drag.longPressTimer !== undefined && !drag.longPressed) {
+            clearTimeout(drag.longPressTimer)
+            drag.longPressTimer = undefined
+          }
+          // While long-press fast-forward is active, movement is ignored.
+          if (drag.longPressed) return
+          drag.axis = Math.abs(dx) > Math.abs(dy) ? 'x' : 'y'
+        }
+
+        if (drag.longPressed) return
+
+        // Measure against the stage, not the window: the sidebar is a slice.
+        var rect = stageRef.current ? stageRef.current.getBoundingClientRect() : null
+        var width = rect && rect.width > 0 ? rect.width : 320
+        var height = rect && rect.height > 0 ? rect.height : 180
+
+        if (drag.axis === 'x') {
+          if (drag.startDuration <= 0) return
+          // A full-width swipe covers SEEK_SWIPE_SPAN seconds, capped to the
+          // clip's own length so a short clip stays controllable.
+          var span = Math.min(SEEK_SWIPE_SPAN, drag.startDuration)
+          var delta = (dx / width) * span
+          var target = clamp(drag.startTime + delta, 0, drag.startDuration)
+          element.currentTime = target
+          setTime(target)
+          setHint({
+            kind: 'seek',
+            text: (delta >= 0 ? '+' : '−') + clockText(Math.abs(target - drag.startTime)) + '  ·  ' + clockText(target),
+          })
+          return
+        }
+
+        // Vertical: full stage height spans the whole 0..1 volume range.
+        var volume = clamp01(drag.startVolume - dy / height)
+        setVolume(volume)
+        setHint({ kind: 'volume', text: Math.round(volume * 100) + '%' })
+      }
+
+      /** Pointer-up: resolve tap vs drag, and restore any temporary rate. */
+      var onPointerUp = function (event) {
+        var drag = gestureRef.current
+        var element = elementRef.current
+        if (!drag || drag.id !== event.pointerId) return
+        gestureRef.current = null
+
+        if (drag.longPressTimer !== undefined) clearTimeout(drag.longPressTimer)
+
+        if (drag.longPressed) {
+          // Return to the rate the user had, not to 1x.
+          if (element) element.playbackRate = drag.savedRate === undefined ? 1 : drag.savedRate
+          if (element && drag.resumeAfterLongPress === false) element.pause()
+          setHint(null)
+          return
+        }
+
+        if (drag.moved) {
+          setHint(null)
+          return
+        }
+
+        // Undecided and unmoved: this is a tap. Delay it so a second tap can
+        // still become a double tap (skip forward / back).
+        var now = Date.now()
+        var rect = stageRef.current ? stageRef.current.getBoundingClientRect() : null
+        var isDouble = now - drag.lastTapAt < DOUBLE_TAP_MS
+          && Math.abs(event.clientX - drag.lastTapX) < 40
+          && Math.abs(event.clientY - drag.lastTapY) < 60
+
+        if (isDouble) {
+          if (tapTimerRef.current !== null) {
+            clearTimeout(tapTimerRef.current)
+            tapTimerRef.current = null
+          }
+          lastTapRef.current = { at: 0, x: 0, y: 0 }
+          if (!element) return
+          // Right half = forward, left half = back (the familiar convention).
+          var forward = rect ? event.clientX >= rect.left + rect.width / 2 : true
+          var next = clamp(element.currentTime + (forward ? SEEK_STEP : -SEEK_STEP), 0, isFinite(element.duration) ? element.duration : 0)
+          seekTo(next)
+          setHint({ kind: 'seek', text: (forward ? '+ ' : '− ') + SEEK_STEP + 's' })
+          setTimeout(function () { setHint(null) }, 600)
+          return
+        }
+
+        lastTapRef.current = { at: now, x: event.clientX, y: event.clientY }
+        tapTimerRef.current = setTimeout(function () {
+          tapTimerRef.current = null
+          lastTapRef.current = { at: 0, x: 0, y: 0 }
+          toggle()
+        }, TAP_DELAY_MS)
+      }
+
+      /** Pointer cancel: restore state without treating it as a tap. */
+      var onPointerCancel = function () {
+        var drag = gestureRef.current
+        var element = elementRef.current
+        gestureRef.current = null
+        if (!drag) return
+        if (drag.longPressTimer !== undefined) clearTimeout(drag.longPressTimer)
+        if (drag.longPressed && element) {
+          element.playbackRate = drag.savedRate === undefined ? 1 : drag.savedRate
+          if (drag.resumeAfterLongPress === false) element.pause()
+        }
+        setHint(null)
+      }
+
       if (isAudio === undefined) return null
       if (data.error !== undefined) {
         return react.createElement('div', { style: STYLE.empty }, data.error)
-      }
-
-      var toggle = function () {
-        var element = elementRef.current
-        if (!element) return
-        if (element.paused) element.play().catch(function (reason) { setError(String(reason && reason.message ? reason.message : reason)) })
-        else element.pause()
-      }
-
-      var seekTo = function (next) {
-        var element = elementRef.current
-        if (!element) return
-        // Clamp against the element's own window; assigning an out-of-range
-        // currentTime is what silently snaps back.
-        var upper = isFinite(element.duration) ? element.duration : 0
-        element.currentTime = Math.max(0, Math.min(next, upper))
-        setTime(element.currentTime)
       }
 
       var cycleRate = function () {
@@ -392,10 +687,40 @@ window.__ModuleLoader__.load({
         src: data.url,
         preload: 'metadata',
         playsInline: true,
+        // No native `controls`: the bar below is the single source of control,
+        // and on touch it is what carries the 44px targets. iOS additionally
+        // honours playsInline + no controls, which keeps the video in place
+        // instead of going fullscreen on play.
         style: isAudio ? { display: 'none' } : STYLE.element,
       })
 
-      var stage = react.createElement('div', { style: STYLE.stage }, [
+      // The gesture surface only exists for video: an audio file has no stage
+      // to swipe, and stealing its taps would fight the bar. On fine pointers
+      // it still provides tap-to-toggle, which is harmless for a mouse.
+      var gestureLayer = isAudio
+        ? null
+        : react.createElement('div', {
+            key: 'gesture',
+            style: STYLE.surface,
+            onPointerDown: onPointerDown,
+            onPointerMove: onPointerMove,
+            onPointerUp: onPointerUp,
+            onPointerCancel: onPointerCancel,
+            // Prevent the browser's own pan/zoom so a swipe is not eaten by
+            // scrolling on touch devices.
+            onContextMenu: function (event) { event.preventDefault() },
+            'aria-hidden': true,
+          })
+
+      var hintNode = null
+      if (hint !== null) {
+        hintNode = react.createElement('div', {
+          key: 'hint',
+          style: Object.assign({}, STYLE.gesture, { left: '50%', top: '50%', transform: 'translate(-50%, -50%)' }),
+        }, hint.text)
+      }
+
+      var stage = react.createElement('div', { key: 'stage', ref: stageRef, style: STYLE.stage }, [
         mediaElement,
         isAudio
           ? react.createElement('div', { key: 'card', style: STYLE.audioCard }, [
@@ -404,41 +729,54 @@ window.__ModuleLoader__.load({
               react.createElement('div', { key: 'meta', style: STYLE.audioMeta }, kindLabel + (data.size > 0 ? ' · ' + sizeText(data.size) : '')),
             ])
           : null,
+        gestureLayer,
+        hintNode,
         error !== null ? react.createElement('div', { key: 'err', style: STYLE.notice }, error) : null,
       ])
 
-      var bar = react.createElement('div', { style: STYLE.bar }, [
+      var barStyle = compact ? STYLE.barCompact : STYLE.bar
+      var buttonStyle = compact ? STYLE.buttonCompact : STYLE.button
+      var seekStyle = compact ? STYLE.seekCompact : STYLE.seek
+
+      var seekInput = react.createElement('input', {
+        key: 'seek',
+        type: 'range',
+        min: 0,
+        max: duration > 0 ? duration : 0,
+        step: 0.01,
+        value: Math.min(time, duration > 0 ? duration : 0),
+        style: seekStyle,
+        'aria-label': 'Seek',
+        disabled: duration <= 0,
+        onChange: function (event) { seekTo(Number(event.target.value)) },
+      })
+
+      var barChildren = [
         react.createElement('button', {
           key: 'play',
           type: 'button',
-          style: STYLE.button,
+          style: buttonStyle,
           onClick: toggle,
           title: paused ? 'Play' : 'Pause',
           'aria-label': paused ? 'Play' : 'Pause',
-        }, iconPlay(16, paused)),
+        }, iconPlay(compact ? 20 : 16, paused)),
         react.createElement('span', { key: 'cur', style: STYLE.time }, clockText(time)),
-        react.createElement('input', {
-          key: 'seek',
-          type: 'range',
-          min: 0,
-          max: duration > 0 ? duration : 0,
-          step: 0.01,
-          value: Math.min(time, duration > 0 ? duration : 0),
-          style: STYLE.seek,
-          'aria-label': 'Seek',
-          disabled: duration <= 0,
-          onChange: function (event) { seekTo(Number(event.target.value)) },
-        }),
+        // Compact: the seek bar takes its own row so it is never squeezed
+        // between the two clocks.
+        compact ? null : seekInput,
         react.createElement('span', { key: 'dur', style: STYLE.time }, clockText(duration)),
         react.createElement('button', {
           key: 'rate',
           type: 'button',
-          style: STYLE.speed,
+          style: compact ? Object.assign({}, STYLE.buttonCompact, { width: 'auto', padding: '0 10px', fontSize: 13 }) : STYLE.speed,
           onClick: cycleRate,
           title: 'Playback speed',
           'aria-label': 'Playback speed',
         }, rate + '×'),
-      ])
+        compact ? react.createElement('div', { key: 'seekrow', style: STYLE.seekRowCompact }, [seekInput]) : null,
+      ]
+
+      var bar = react.createElement('div', { style: barStyle }, barChildren)
 
       var footer = react.createElement('div', { style: STYLE.footer }, [
         react.createElement('span', { key: 'n', style: STYLE.name, title: data.path }, data.name),
