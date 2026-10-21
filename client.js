@@ -124,6 +124,75 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * Look for a sidecar `.lrc` next to the media file.
+     *
+     * The host owns the filesystem probe and the LRC parsing; this only asks.
+     * A missing sidecar is the ordinary case, so it resolves to null rather
+     * than rejecting — the player then renders without a lyric panel.
+     * @param path - the media path better-sidebar opened.
+     * @param scope - the session scope.
+     * @param signal - aborts the probe on unmount.
+     * @returns `{ found, lines, meta, name }` or null.
+     */
+    async function loadLyrics(path, scope, signal) {
+      var params = { sessionId: scope.sessionId, path: path, cwd: scope.cwd }
+      try {
+        var response = await fetch(routeUrl('lyrics', params), {
+          signal: signal,
+          headers: { accept: 'application/json' },
+        })
+        if (!response.ok) return null
+        var envelope = await response.json().catch(function () { return null })
+        if (envelope === null || envelope.ok !== true || !envelope.value || envelope.value.found !== true) return null
+        var value = envelope.value
+        if (!Array.isArray(value.lines) || value.lines.length === 0) return null
+        return {
+          name: typeof value.name === 'string' ? value.name : 'lyrics',
+          meta: value.meta && typeof value.meta === 'object' ? value.meta : {},
+          lines: value.lines
+            .filter(function (line) { return line && typeof line.time === 'number' && typeof line.text === 'string' })
+            .map(function (line) {
+              return {
+                time: line.time,
+                text: line.text,
+                section: typeof line.section === 'string' && line.section !== '' ? line.section : null,
+              }
+            }),
+        }
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') return null
+        return null
+      }
+    }
+
+    /**
+     * Index of the lyric line in effect at `time`.
+     *
+     * Binary search: the array is time-sorted, and this runs on every
+     * timeupdate, so a linear scan over a long lyric would be wasteful.
+     * @param lines - time-sorted lyric lines.
+     * @param time - playback position in seconds.
+     * @returns the index, or -1 before the first line.
+     */
+    function lyricIndexAt(lines, time) {
+      if (!Array.isArray(lines) || lines.length === 0) return -1
+      if (time < lines[0].time) return -1
+      var low = 0
+      var high = lines.length - 1
+      var found = -1
+      while (low <= high) {
+        var mid = (low + high) >> 1
+        if (lines[mid].time <= time) {
+          found = mid
+          low = mid + 1
+        } else {
+          high = mid - 1
+        }
+      }
+      return found
+    }
+
     // ── formatting ─────────────────────────────────────────────────────────
 
     /** Clock text for one offset (0:07 / 3:41 / 1:02:03). */
@@ -214,6 +283,155 @@ window.__ModuleLoader__.load({
     /** Seek step for Shift+arrow, in seconds. */
     var KEY_SEEK_STEP_LARGE = 30
 
+    /**
+     * Live spectrum along the bottom of the audio stage.
+     *
+     * One spectrum component for audio only: video has a picture to look at and
+     * a canvas animating under it would just burn battery.
+     *
+     * The analyser is fed from a `MediaElementSource`, which REQUIRES the media
+     * to be CORS-clean — that is exactly why the client sets
+     * `crossOrigin="anonymous"` before `src`. Without it the analyser returns
+     * all zeros and this canvas would sit permanently flat.
+     *
+     * @param props - `element` is the live <audio> node, `playing` gates the
+     *   animation loop so a paused player stops repainting.
+     */
+    function Spectrum(props) {
+      var canvasRef = react.useRef(null)
+      var wrapRef = react.useRef(null)
+      var audioRef = react.useRef(null)
+      /** `{ analyser, bins, context }` once Web Audio is wired. */
+      var analyserRef = react.useRef(null)
+      var playing = props.playing
+
+      // Build the analyser graph once per element. `createMediaElementSource`
+      // throws if called twice for one element, so it is memoized here.
+      react.useEffect(function () {
+        var element = props.element
+        if (!element || typeof window === 'undefined') return undefined
+        var Ctor = window.AudioContext || window.webkitAudioContext
+        if (!Ctor) return undefined
+
+        var context
+        try {
+          context = new Ctor()
+        } catch (error) {
+          return undefined
+        }
+
+        var analyser
+        var bins
+        try {
+          analyser = context.createAnalyser()
+          analyser.fftSize = 512
+          analyser.smoothingTimeConstant = 0.75
+          var source = context.createMediaElementSource(element)
+          source.connect(analyser)
+          // Also route to the speakers, or the graph swallows the sound.
+          analyser.connect(context.destination)
+          bins = new Uint8Array(analyser.frequencyBinCount)
+        } catch (error) {
+          try { context.close() } catch (ignored) { /* nothing to close */ }
+          return undefined
+        }
+
+        analyserRef.current = { analyser: analyser, bins: bins, context: context }
+
+        return function () {
+          analyserRef.current = null
+          try { analyser.disconnect() } catch (ignored) { /* already gone */ }
+          try { context.close() } catch (ignored) { /* already closed */ }
+        }
+      }, [props.element])
+
+      // Browsers start an AudioContext suspended until a gesture; resume on play.
+      react.useEffect(function () {
+        var state = analyserRef.current
+        if (!state || !playing) return
+        if (state.context.state === 'suspended') state.context.resume().catch(function () { /* gesture required */ })
+      }, [playing])
+
+      // Draw loop. Runs only while playing and on-screen.
+      react.useEffect(function () {
+        var canvas = canvasRef.current
+        if (!canvas || typeof requestAnimationFrame !== 'function') return undefined
+        var stopped = false
+        var frame = 0
+
+        var draw = function () {
+          if (stopped) return
+          var state = analyserRef.current
+          var rect = canvas.getBoundingClientRect()
+          var ratio = Math.min(2, Math.max(1, window.devicePixelRatio || 1))
+          var width = Math.max(1, Math.floor(rect.width * ratio))
+          var height = Math.max(1, Math.floor(rect.height * ratio))
+          if (canvas.width !== width || canvas.height !== height) {
+            canvas.width = width
+            canvas.height = height
+          }
+          var ctx = canvas.getContext('2d')
+          if (!ctx) return
+          ctx.clearRect(0, 0, width, height)
+
+          var BARS = 56
+          var gap = Math.max(1, Math.round(ratio))
+          var barWidth = Math.max(1, (width - gap * (BARS - 1)) / BARS)
+
+          // Sample only the lower half of the spectrum: music energy lives
+          // there, and the top bins of a 256-bin FFT are almost always empty.
+          var bins = state ? state.bins : null
+          if (state) state.analyser.getByteFrequencyData(bins)
+          var usable = bins ? Math.floor(bins.length * 0.55) : 0
+
+          for (var i = 0; i < BARS; i += 1) {
+            var value = 0
+            if (bins && usable > 0) {
+              // Average the bins that fall into this bar for a stable shape.
+              var from = Math.floor((i / BARS) * usable)
+              var to = Math.max(from + 1, Math.floor(((i + 1) / BARS) * usable))
+              var sum = 0
+              for (var b = from; b < to; b += 1) sum += bins[b]
+              value = sum / (to - from) / 255
+            }
+            // A little floor so a silent passage still shows a baseline.
+            var level = Math.max(0.02, value)
+            var barHeight = Math.max(barWidth, level * height * 0.92)
+            var x = i * (barWidth + gap)
+            var y = height - barHeight
+            var gradient = ctx.createLinearGradient(0, height, 0, y)
+            gradient.addColorStop(0, 'rgba(120,170,255,0.95)')
+            gradient.addColorStop(0.55, 'rgba(160,140,255,0.85)')
+            gradient.addColorStop(1, 'rgba(255,150,220,0.75)')
+            ctx.fillStyle = gradient
+            var radius = Math.min(barWidth / 2, 3 * ratio)
+            if (typeof ctx.roundRect === 'function') {
+              ctx.beginPath()
+              ctx.roundRect(x, y, barWidth, barHeight, radius)
+              ctx.fill()
+            } else {
+              ctx.fillRect(x, y, barWidth, barHeight)
+            }
+          }
+
+          frame = requestAnimationFrame(draw)
+        }
+
+        frame = requestAnimationFrame(draw)
+        return function () {
+          stopped = true
+          cancelAnimationFrame(frame)
+        }
+      }, [playing])
+
+      return react.createElement('div', { ref: wrapRef, style: STYLE.spectrum },
+        react.createElement('canvas', {
+          ref: canvasRef,
+          style: { display: 'block', width: '100%', height: '100%' },
+          'aria-hidden': true,
+        }))
+    }
+
     // ── icons (16px, currentColor, the app's outline style) ────────────────
 
     function iconAudio(size) {
@@ -291,11 +509,88 @@ window.__ModuleLoader__.load({
         display: 'flex', flexDirection: 'column', alignItems: 'center',
         justifyContent: 'center', gap: 8, padding: 24, textAlign: 'center',
       },
-      audioTitle: {
-        fontSize: 13, maxWidth: '100%', overflow: 'hidden',
-        textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+      /**
+       * Frosted-glass backdrop for the audio stage.
+       *
+       * `backdropFilter` samples whatever renders BEHIND this element, so the
+       * colour wash and the blurred artwork are separate layers: the wash paints
+       * the tint, and `backdrop-blur` applied to the stage blurs the cover art
+       * we deliberately over-scale underneath it. Overscaling is what stops the
+       * blur from pulling in transparent edges and producing a grey halo.
+       */
+      audioStage: {
+        position: 'relative', flex: '1 1 auto', minHeight: 140, minWidth: 0,
+        display: 'flex', flexDirection: 'column',
+        alignItems: 'center', justifyContent: 'center',
+        gap: 10, overflow: 'hidden', borderRadius: 10,
+        // Fallbacks first: a skin may not define the glass aliases.
+        background: 'var(--dsw-alias-bg-layer-1, rgba(255,255,255,0.06))',
+        border: '1px solid var(--dsw-alias-border-l1, rgba(255,255,255,0.10))',
+        isolation: 'isolate',
       },
-      audioMeta: { fontSize: 11, color: 'var(--dsw-alias-label-secondary, #8b90a0)' },
+      /** The blurred colour wash behind the glass. */
+      glassWash: {
+        position: 'absolute', inset: '-24%', zIndex: 0,
+        background: 'radial-gradient(60% 60% at 30% 25%, rgba(96,140,255,0.42), transparent 70%), radial-gradient(55% 55% at 75% 70%, rgba(255,120,190,0.34), transparent 70%), radial-gradient(50% 50% at 50% 100%, rgba(120,255,215,0.22), transparent 72%)',
+        filter: 'blur(28px) saturate(150%)',
+        transform: 'scale(1.15)',
+        opacity: 0.9,
+        pointerEvents: 'none',
+      },
+      /** Content layer above the wash. */
+      glassContent: {
+        position: 'relative', zIndex: 1, display: 'flex', flexDirection: 'column',
+        alignItems: 'center', justifyContent: 'center', gap: 8,
+        padding: '18px 24px 6px', textAlign: 'center', minHeight: 0,
+        maxWidth: '100%',
+      },
+      audioTitle: {
+        fontSize: 15, fontWeight: 500, maxWidth: '100%', overflow: 'hidden',
+        textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        textShadow: '0 1px 8px rgba(0,0,0,0.35)',
+      },
+      audioMeta: {
+        fontSize: 11, color: 'var(--dsw-alias-label-secondary, rgba(230,233,240,0.72))',
+      },
+      /** The always-moving spectrum along the bottom of the audio stage. */
+      spectrum: {
+        position: 'relative', zIndex: 1, flex: '0 0 auto',
+        width: '100%', height: 64, display: 'block',
+        pointerEvents: 'none', opacity: 0.95,
+      },
+      /** Lyric panel: scrolls, one highlighted line at a time. */
+      lyrics: {
+        position: 'relative', zIndex: 1,
+        flex: '1 1 auto', minHeight: 0, width: '100%',
+        display: 'flex', flexDirection: 'column', gap: 6,
+        overflowY: 'auto', overflowX: 'hidden',
+        padding: '6px 16px 10px',
+        maskImage: 'linear-gradient(to bottom, transparent, #000 12%, #000 88%, transparent)',
+        WebkitMaskImage: 'linear-gradient(to bottom, transparent, #000 12%, #000 88%, transparent)',
+        scrollbarWidth: 'thin',
+      },
+      lyricLine: {
+        flex: '0 0 auto', fontSize: 13, lineHeight: '20px',
+        color: 'var(--dsw-alias-label-secondary, rgba(230,233,240,0.55))',
+        textAlign: 'center', overflowWrap: 'anywhere',
+        transition: 'color 220ms ease, transform 220ms ease, opacity 220ms ease',
+        opacity: 0.8, cursor: 'pointer',
+        textShadow: '0 1px 6px rgba(0,0,0,0.3)',
+      },
+      lyricLineActive: {
+        flex: '0 0 auto', fontSize: 14, lineHeight: '21px', fontWeight: 600,
+        color: 'var(--dsw-alias-label-primary, #ffffff)',
+        textAlign: 'center', overflowWrap: 'anywhere',
+        transition: 'color 220ms ease, transform 220ms ease, opacity 220ms ease',
+        opacity: 1, cursor: 'pointer', transform: 'scale(1.03)',
+        textShadow: '0 1px 10px rgba(0,0,0,0.5)',
+      },
+      lyricSection: {
+        flex: '0 0 auto', fontSize: 10, letterSpacing: '0.08em',
+        textTransform: 'uppercase', textAlign: 'center',
+        color: 'var(--dsw-alias-label-secondary, rgba(230,233,240,0.45))',
+        paddingTop: 4,
+      },
       bar: {
         flex: '0 0 auto', display: 'flex', alignItems: 'center', gap: 8,
         fontSize: 12, minWidth: 0,
@@ -470,6 +765,11 @@ window.__ModuleLoader__.load({
       // Gesture feedback: { kind: 'seek'|'volume'|'rate', text, side } or null.
       var hintState = react.useState(null)
       var hint = hintState[0], setHint = hintState[1]
+      // Sidecar lyrics, for audio only. `null` = none found (no panel).
+      var lyricsState = react.useState(null)
+      var lyrics = lyricsState[0], setLyrics = lyricsState[1]
+      /** Scroll container for the lyric panel (kept in view as time advances). */
+      var lyricsRef = react.useRef(null)
 
       /**
        * Live gesture state. A ref (not state) because pointermove must not
@@ -491,6 +791,50 @@ window.__ModuleLoader__.load({
           }
         }
       }, [])
+
+      /**
+       * Load the sidecar lyrics once per file.
+       *
+       * The probe runs for audio only: a video with a matching .lrc is a
+       * karaoke file, which this player does not render, so asking would waste a
+       * request on every video open.
+       */
+      react.useEffect(function () {
+        if (!isAudio) return undefined
+        var cancelled = false
+        var controller = typeof AbortController === 'function' ? new AbortController() : undefined
+        setLyrics(null)
+        loadLyrics(data.path, props.scope || {}, controller ? controller.signal : undefined).then(function (found) {
+          if (cancelled) return
+          setLyrics(found)
+        })
+        return function () {
+          cancelled = true
+          if (controller) controller.abort()
+        }
+      }, [data.path, isAudio])
+
+      /**
+       * Keep the active lyric line in view.
+       *
+       * Scrolls the CONTAINER rather than calling `scrollIntoView`, which walks
+       * up and would move the app's own scrollers — a known way to shift the
+       * whole sidebar — so the offset maths stays local to the panel.
+       */
+      react.useEffect(function () {
+        var container = lyricsRef.current
+        if (!container || lyrics === null) return
+        var index = lyricIndexAt(lyrics.lines, time)
+        if (index < 0) return
+        var current = lyrics.lines[index]
+        var target
+        for (var i = 0; i < container.children.length; i += 1) {
+          if (container.children[i].textContent === current.text) { target = container.children[i]; break }
+        }
+        if (target === undefined) return
+        var top = target.offsetTop - container.clientHeight / 2 + target.clientHeight / 2
+        container.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
+      }, [time, lyrics])
 
       var seekTo = function (next) {
         var element = elementRef.current
@@ -889,7 +1233,12 @@ window.__ModuleLoader__.load({
         // and on touch it is what carries the 44px targets. iOS additionally
         // honours playsInline + no controls, which keeps the video in place
         // instead of going fullscreen on play.
-        style: isAudio ? { display: 'none' } : STYLE.element,
+        // `display: none` would stop the media element from being a real audio
+        // sink in some engines and leaves the analyser flat; a zero-sized but
+        // laid-out box keeps playback and the Web Audio graph intact.
+        style: isAudio
+          ? { position: 'absolute', width: 1, height: 1, opacity: 0, pointerEvents: 'none', left: -9999 }
+          : STYLE.element,
       })
 
       // The gesture surface only exists for video: an audio file has no stage
@@ -918,19 +1267,72 @@ window.__ModuleLoader__.load({
         }, hint.text)
       }
 
-      var stage = react.createElement('div', { key: 'stage', ref: stageRef, style: STYLE.stage }, [
-        mediaElement,
-        isAudio
-          ? react.createElement('div', { key: 'card', style: STYLE.audioCard }, [
-              react.createElement('div', { key: 'i', style: { opacity: 0.85 } }, iconAudio(46)),
+      // ── audio stage: frosted glass + spectrum + lyrics ───────────────────
+      var lyricIndex = lyrics === null ? -1 : lyricIndexAt(lyrics.lines, time)
+
+      /** One lyric row; clicking it seeks to that line. */
+      var lyricRow = function (line, index) {
+        var active = index === lyricIndex
+        return react.createElement('div', {
+          key: 'lyric-' + index,
+          style: active ? STYLE.lyricLineActive : STYLE.lyricLine,
+          onClick: function () { seekTo(line.time) },
+          title: 'Jump to ' + clockText(line.time),
+        }, line.text)
+      }
+
+      var lyricsPanel = null
+      if (lyrics !== null) {
+        var rows = []
+        var lastSection = null
+        for (var li = 0; li < lyrics.lines.length; li += 1) {
+          var line = lyrics.lines[li]
+          // Section headers appear once, above the first line that names them.
+          if (line.section !== null && line.section !== lastSection) {
+            rows.push(react.createElement('div', { key: 'sec-' + li, style: STYLE.lyricSection }, line.section))
+            lastSection = line.section
+          }
+          rows.push(lyricRow(line, li))
+        }
+        lyricsPanel = react.createElement('div', {
+          key: 'lyrics',
+          ref: lyricsRef,
+          style: STYLE.lyrics,
+          'aria-label': 'Lyrics',
+        }, rows)
+      }
+
+      var spectrumPanel = isAudio
+        ? react.createElement(Spectrum, { key: 'spectrum', element: elementRef.current, playing: !paused })
+        : null
+
+      var audioStage = isAudio
+        ? react.createElement('div', { key: 'stage', ref: stageRef, style: STYLE.audioStage }, [
+            // The <audio> element must live inside this subtree: Spectrum reads
+            // it to build the analyser graph, and it stays mounted (hidden) so
+            // the graph survives re-renders.
+            mediaElement,
+            react.createElement('div', { key: 'wash', style: STYLE.glassWash }),
+            react.createElement('div', { key: 'card', style: STYLE.glassContent }, [
+              react.createElement('div', { key: 'i', style: { opacity: 0.9 } }, iconAudio(40)),
               react.createElement('div', { key: 'name', style: STYLE.audioTitle, title: data.name }, data.name),
-              react.createElement('div', { key: 'meta', style: STYLE.audioMeta }, kindLabel + (data.size > 0 ? ' · ' + sizeText(data.size) : '')),
-            ])
-          : null,
-        gestureLayer,
-        hintNode,
-        error !== null ? react.createElement('div', { key: 'err', style: STYLE.notice }, error) : null,
-      ])
+              react.createElement('div', { key: 'meta', style: STYLE.audioMeta }, kindLabel + (data.size > 0 ? ' · ' + sizeText(data.size) : '') + (lyrics !== null ? ' · ' + lyrics.lines.length + ' 行歌词' : '')),
+            ]),
+            lyricsPanel,
+            spectrumPanel,
+            hintNode,
+            error !== null ? react.createElement('div', { key: 'err', style: STYLE.notice }, error) : null,
+          ])
+        : null
+
+      var stage = isAudio
+        ? audioStage
+        : react.createElement('div', { key: 'stage', ref: stageRef, style: STYLE.stage }, [
+            mediaElement,
+            gestureLayer,
+            hintNode,
+            error !== null ? react.createElement('div', { key: 'err', style: STYLE.notice }, error) : null,
+          ])
 
       var barStyle = compact ? STYLE.barCompact : STYLE.bar
       var buttonStyle = compact ? STYLE.buttonCompact : STYLE.button

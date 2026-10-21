@@ -39,7 +39,7 @@
  * @module dsh-media-preview
  */
 import { createReadStream } from 'node:fs'
-import { stat } from 'node:fs/promises'
+import { readFile, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, extname, isAbsolute, join, resolve } from 'node:path'
 
@@ -60,6 +60,12 @@ const META_PATH = `${ROUTE_PREFIX}/meta`
 
 /** Media endpoint (bytes, Range-capable). */
 const MEDIA_PATH = `${ROUTE_PREFIX}/media`
+
+/** Sidecar lyrics endpoint (JSON; empty result when no .lrc sits beside the file). */
+const LYRICS_PATH = `${ROUTE_PREFIX}/lyrics`
+
+/** Extensions probed for sidecar lyrics, in preference order. */
+const LYRIC_EXTS = ['lrc', 'LRC', 'Lrc']
 
 /**
  * Origin of the Electron desktop shell's application page. The shell serves the
@@ -310,6 +316,162 @@ function parseRange(raw, size) {
   return { start, end: Math.min(end, size - 1) }
 }
 
+// ── sidecar lyrics ──────────────────────────────────────────────────────────
+
+/** `[mm:ss.xx]`, `[mm:ss:xx]`, `[mm:ss]`, and the `[hh:mm:ss]` variant. */
+const LRC_TIME = /\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]/g
+
+/** `[ti:…]`-style metadata tags, which are not timed lines. */
+const LRC_META = /^\[(ti|ar|al|by|offset|length|re|ve|au|tool|encoding):(.*)\]$/i
+
+/** A whole-line bracketed section marker such as `[Verse 1]` or `[Chorus]`. */
+const LRC_SECTION = /^\[([^[\]]+)\]\s*$/
+
+/** A bracketed section marker at the START of a line that also carries text. */
+const LRC_SECTION_LEADING = /^\[([^[\]]+)\]/
+
+/**
+ * Parse LRC text into timed lyric lines.
+ *
+ * Handles the shapes real files use:
+ *   - CRLF and a UTF-8 BOM (a BOM otherwise hides the first timestamp);
+ *   - several timestamps on one line, which repeat the same text
+ *     (`[00:10.00][01:20.00]chorus`);
+ *   - `[Verse 1]` / `[Chorus]` marker lines, kept as section labels on the NEXT
+ *     timed line rather than emitted as lyrics of their own — in this format
+ *     the marker usually shares its timestamp with the line that follows, so
+ *     emitting both would show a duplicate;
+ *   - a negative `[offset:]` tag, applied to every timestamp.
+ *
+ * @param text - the raw `.lrc` file contents.
+ * @returns `{ lines, meta }` where lines are `{ time, text, section }` sorted
+ *   by time; lines with empty text are dropped.
+ */
+function parseLyrics(text) {
+  const source = text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n')
+  const meta = {}
+  const lines = []
+  let pendingSection = null
+
+  for (const rawLine of source.split('\n')) {
+    const line = rawLine.trim()
+    if (line === '') continue
+
+    const metaMatch = LRC_META.exec(line)
+    if (metaMatch !== null) {
+      meta[metaMatch[1].toLowerCase()] = metaMatch[2].trim()
+      continue
+    }
+
+    // Collect every timestamp at the start of the line.
+    LRC_TIME.lastIndex = 0
+    const stamps = []
+    let cursor = 0
+    let match
+    while ((match = LRC_TIME.exec(line)) !== null) {
+      // Only leading timestamps count; a bracket inside the text is not one.
+      if (match.index !== cursor) break
+      cursor = match.index + match[0].length
+      const minutes = Number(match[1])
+      const seconds = Number(match[2])
+      const fractionText = match[3] ?? '0'
+      // `.5` means 500ms, `.50` 500ms, `.500` 500ms — pad to milliseconds.
+      const millis = Number(`${fractionText}00`.slice(0, 3))
+      stamps.push(minutes * 60 + seconds + millis / 1000)
+    }
+
+    if (stamps.length === 0) {
+      const sectionMatch = LRC_SECTION.exec(line)
+      if (sectionMatch !== null) pendingSection = sectionMatch[1].trim()
+      continue
+    }
+
+    const body = line.slice(cursor).trim()
+    if (body === '') {
+      // A bare timestamp carrying a section label: `[00:13.80][Verse 1]`.
+      const sectionMatch = LRC_SECTION.exec(line.slice(cursor).trim())
+      if (sectionMatch !== null) pendingSection = sectionMatch[1].trim()
+      continue
+    }
+
+    // The text may itself begin with a section marker: `[00:13.80][Verse 1]…`.
+    let text_ = body
+    let section = pendingSection
+    const inlineSection = LRC_SECTION_LEADING.exec(text_)
+    if (inlineSection !== null) {
+      section = inlineSection[1].trim()
+      text_ = text_.slice(inlineSection[0].length).trim()
+      if (text_ === '') { pendingSection = section; continue }
+    }
+    pendingSection = null
+
+    for (const time of stamps) lines.push({ time, text: text_, section })
+  }
+
+  const offset = Number(meta.offset)
+  if (Number.isFinite(offset) && offset !== 0) {
+    // `offset` is in milliseconds and follows the LRC convention that a POSITIVE
+    // value makes lyrics appear EARLIER (it is subtracted from each timestamp).
+    for (const line of lines) line.time = Math.max(0, line.time - offset / 1000)
+  }
+
+  lines.sort((left, right) => left.time - right.time)
+  return { lines, meta }
+}
+
+/**
+ * Look for a sidecar `.lrc` beside the media file.
+ * @param mediaPath - absolute path of the audio/video file.
+ * @returns the sidecar path, or undefined.
+ */
+async function findLyricsFile(mediaPath) {
+  const base = mediaPath.replace(/\.[^./\\]+$/, '')
+  for (const ext of LYRIC_EXTS) {
+    const candidate = `${base}.${ext}`
+    try {
+      const info = await stat(candidate)
+      if (info.isFile() && info.size > 0) return candidate
+    } catch {
+      /* try the next casing */
+    }
+  }
+  return undefined
+}
+
+/**
+ * Answer the lyrics probe.
+ *
+ * Missing lyrics are NOT an error: the client asks for every audio file, and
+ * "no sidecar" is the ordinary case. The reply is `{ found: false }` so the
+ * player renders without a lyric panel instead of surfacing a failure.
+ * @param url - the parsed request URL.
+ * @param ctx - the host context slice.
+ * @param response - the response to answer.
+ * @param cors - CORS headers for this request.
+ */
+async function handleLyrics(url, ctx, response, cors) {
+  const facts = await statRequestedFile(url, ctx)
+  const lyricsPath = await findLyricsFile(facts.path)
+  if (lyricsPath === undefined) {
+    writeJson(response, 200, { found: false }, cors)
+    return
+  }
+  let text
+  try {
+    text = await readFile(lyricsPath, 'utf8')
+  } catch {
+    writeJson(response, 200, { found: false }, cors)
+    return
+  }
+  const parsed = parseLyrics(text)
+  writeJson(response, 200, {
+    found: parsed.lines.length > 0,
+    name: basename(lyricsPath),
+    meta: parsed.meta,
+    lines: parsed.lines,
+  }, cors)
+}
+
 // ── responses ───────────────────────────────────────────────────────────────
 
 /** Answer one wire error (or destroy the response when headers already went out). */
@@ -474,6 +636,10 @@ async function handleRequest(request, response, ctx) {
       await handleMedia(url, ctx, request, response, cors)
       return
     }
+    if (pathname === LYRICS_PATH) {
+      await handleLyrics(url, ctx, response, cors)
+      return
+    }
     writeError(response, 404, 'not-found', `unknown route ${url.pathname}`, cors)
   } catch (error) {
     if (error instanceof MediaError) writeError(response, error.status, error.code, error.message, cors)
@@ -498,4 +664,4 @@ export function apply(ctx) {
   }), 'dsh-media-preview: media routes')
 }
 
-export { AUDIO_EXTS, VIDEO_EXTS, MEDIA_EXT_SET, MEDIA_TYPES, parseRange, isTrustedRequest, corsFor }
+export { AUDIO_EXTS, VIDEO_EXTS, MEDIA_EXT_SET, MEDIA_TYPES, parseRange, parseLyrics, isTrustedRequest, corsFor }
