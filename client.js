@@ -591,6 +591,18 @@ window.__ModuleLoader__.load({
         color: 'var(--dsw-alias-label-secondary, rgba(230,233,240,0.45))',
         paddingTop: 4,
       },
+      /**
+       * Spacer above the first line and below the last.
+       *
+       * Without these the first line can never reach the vertical centre (the
+       * list simply starts at scrollTop 0), so "centre the active line" would be
+       * silently wrong for the opening and closing lines. `flex: 0 0 45%` gives
+       * each end about half a panel of slack, which is enough to centre the
+       * first and last rows.
+       */
+      lyricPad: {
+        flex: '0 0 45%', minHeight: 40, pointerEvents: 'none',
+      },
       bar: {
         flex: '0 0 auto', display: 'flex', alignItems: 'center', gap: 8,
         fontSize: 12, minWidth: 0,
@@ -815,25 +827,50 @@ window.__ModuleLoader__.load({
       }, [data.path, isAudio])
 
       /**
-       * Keep the active lyric line in view.
+       * Centre the active lyric line, but only when it drifts out of the middle
+       * band of the panel.
        *
-       * Scrolls the CONTAINER rather than calling `scrollIntoView`, which walks
-       * up and would move the app's own scrollers — a known way to shift the
-       * whole sidebar — so the offset maths stays local to the panel.
+       * Re-centring on every line change makes the text crawl continuously;
+       * leaving it alone lets the highlight sink to the bottom edge and vanish
+       * behind the spectrum. The middle band is the compromise: while the active
+       * line is comfortably inside it, the list stays still, and the moment it
+       * leaves, the line snaps back to centre.
+       *
+       * `CENTRE_BAND` is the tolerated zone as a fraction of the panel height
+       * (0.28 → the middle 28%, i.e. roughly ±14% around the centre line).
+       *
+       * Scrolling is container-local on purpose: `scrollIntoView` walks up and
+       * would move the app's own scrollers, a known way to shift the sidebar.
        */
+      var CENTRE_BAND = 0.28
       react.useEffect(function () {
         var container = lyricsRef.current
         if (!container || lyrics === null) return
         var index = lyricIndexAt(lyrics.lines, time)
         if (index < 0) return
-        var current = lyrics.lines[index]
+
+        // Locate the row by its recorded data attribute: matching on text would
+        // break on two identical choruses, which this format repeats a lot.
         var target
         for (var i = 0; i < container.children.length; i += 1) {
-          if (container.children[i].textContent === current.text) { target = container.children[i]; break }
+          if (container.children[i].getAttribute && container.children[i].getAttribute('data-lyric') === String(index)) {
+            target = container.children[i]
+            break
+          }
         }
         if (target === undefined) return
-        var top = target.offsetTop - container.clientHeight / 2 + target.clientHeight / 2
-        container.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
+
+        // Position of the row's centre within the scroll viewport.
+        var rowCentre = target.offsetTop + target.clientHeight / 2
+        var viewCentre = container.scrollTop + container.clientHeight / 2
+        var distance = rowCentre - viewCentre
+        var tolerance = (container.clientHeight * CENTRE_BAND) / 2
+        if (Math.abs(distance) <= tolerance) return
+
+        // Snap the row to the viewport centre.
+        var top = rowCentre - container.clientHeight / 2
+        var maxTop = container.scrollHeight - container.clientHeight
+        container.scrollTo({ top: Math.max(0, Math.min(top, maxTop)), behavior: 'smooth' })
       }, [time, lyrics])
 
       var seekTo = function (next) {
@@ -1316,6 +1353,9 @@ window.__ModuleLoader__.load({
         var active = index === lyricIndex
         return react.createElement('div', {
           key: 'lyric-' + index,
+          // The scroll effect finds the active row by this attribute; matching
+          // on text would hit the wrong copy of a repeated chorus.
+          'data-lyric': String(index),
           style: active ? STYLE.lyricLineActive : STYLE.lyricLine,
           onClick: function () { seekTo(line.time) },
           title: 'Jump to ' + clockText(line.time),
@@ -1325,6 +1365,9 @@ window.__ModuleLoader__.load({
       var lyricsPanel = null
       if (lyrics !== null) {
         var rows = []
+        // Leading spacer: lets the FIRST line reach the vertical centre, which
+        // it otherwise never could because the list starts at scrollTop 0.
+        rows.push(react.createElement('div', { key: 'pad-top', style: STYLE.lyricPad, 'aria-hidden': true }))
         var lastSection = null
         for (var li = 0; li < lyrics.lines.length; li += 1) {
           var line = lyrics.lines[li]
@@ -1335,6 +1378,8 @@ window.__ModuleLoader__.load({
           }
           rows.push(lyricRow(line, li))
         }
+        // Trailing spacer: same reason for the LAST line.
+        rows.push(react.createElement('div', { key: 'pad-bottom', style: STYLE.lyricPad, 'aria-hidden': true }))
         lyricsPanel = react.createElement('div', {
           key: 'lyrics',
           ref: lyricsRef,
