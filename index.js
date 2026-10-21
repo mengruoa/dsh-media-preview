@@ -75,10 +75,18 @@ const AUDIO_EXTS = [
   'wma', 'aif', 'aiff', 'amr', 'ape', 'caf', 'mka', 'weba',
 ]
 
-/** Video extensions this plugin previews (lowercase, no dot). */
+/**
+ * Video extensions this plugin previews (lowercase, no dot).
+ *
+ * `.ts` is deliberately ABSENT. In a transport-stream sense it is a video
+ * container, but in this harness `.ts` is overwhelmingly a TypeScript source
+ * file, and an extension match here would shadow the built-in code viewer (the
+ * same collision the sibling plugin hit upstream). M2TS/MTS remain: they are
+ * unambiguous.
+ */
 const VIDEO_EXTS = [
   'mp4', 'm4v', 'webm', 'ogv', 'mov', 'qt', 'mkv', 'avi', 'wmv', 'flv',
-  'mpeg', 'mpg', '3gp', '3g2', 'm2ts', 'ts', 'mts',
+  'mpeg', 'mpg', '3gp', '3g2', 'm2ts', 'mts',
 ]
 
 /** Media types by extension. */

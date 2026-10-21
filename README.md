@@ -58,7 +58,7 @@ Electron 壳的 `forwardWebRequest` 转发每个响应时会删除 `content-leng
 | 类型 | 扩展名 |
 |---|---|
 | 音频 | `mp3` `wav` `wave` `ogg` `oga` `opus` `flac` `m4a` `aac` `wma` `aif` `aiff` `amr` `ape` `caf` `mka` `weba` |
-| 视频 | `mp4` `m4v` `webm` `ogv` `mov` `qt` `mkv` `avi` `wmv` `flv` `mpeg` `mpg` `3gp` `3g2` `m2ts` `ts` `mts` |
+| 视频 | `mp4` `m4v` `webm` `ogv` `mov` `qt` `mkv` `avi` `wmv` `flv` `mpeg` `mpg` `3gp` `3g2` `m2ts` `mts` |
 
 能否真正解码取决于浏览器内核（例如部分 HEVC / AV1 组合），不支持的格式可以用「Download」取回原文件。
 

@@ -40,9 +40,12 @@ window.__ModuleLoader__.load({
       'mp3', 'wav', 'wave', 'ogg', 'oga', 'opus', 'flac', 'm4a', 'aac',
       'wma', 'aif', 'aiff', 'amr', 'ape', 'caf', 'mka', 'weba',
     ]
+    // `.ts` is deliberately absent: in this harness it is a TypeScript source
+    // file far more often than a transport stream, and claiming it would
+    // shadow the built-in code viewer.
     var VIDEO_EXTS = [
       'mp4', 'm4v', 'webm', 'ogv', 'mov', 'qt', 'mkv', 'avi', 'wmv', 'flv',
-      'mpeg', 'mpg', '3gp', '3g2', 'm2ts', 'ts', 'mts',
+      'mpeg', 'mpg', '3gp', '3g2', 'm2ts', 'mts',
     ]
 
     /** Route prefix registered by the host half. */
